@@ -1,0 +1,50 @@
+# Python standard
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*build/
+*develop-eggs/
+*dist/
+*downloads/
+*eggs/
+*.egg-info/
+*lib/
+*lib64/
+*parts/
+*sdist/
+*var/
+*wheels/
+*share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.manifest
+*.spec
+
+# Virtual Environments
+venv/
+env/
+.venv/
+.env/
+
+# Secrets and credentials
+.env
+
+# Datasets - Var försiktig med denna! 
+# Om du har SMÅ, icke-känsliga test-CSV:er kan du ta bort raden nedan.
+# Men stora eller känsliga datafiler ska ALDRIG checkas in.
+*.csv
+*.db
+*.sqlite3
+
+# Sparade modeller
+# Dessa kan bli stora och bör inte versionshanteras.
+*.joblib
+*.pkl
+
+# IDE / Editor-filer
+.vscode/
+.idea/
+
+# OS-specifika filer
+.DS_Store
