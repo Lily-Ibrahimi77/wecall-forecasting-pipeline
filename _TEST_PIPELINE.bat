@@ -40,16 +40,7 @@ ECHO.
 ECHO ==========================================================
 ECHO KOR PIPELINE...
 ECHO ==========================================================
-ECHO.
-ECHO ----------------------------------------------------------
-ECHO Steg 0: Kor 0_Load_Bronze_Data.py...
-ECHO (Kopierar radata fran MariaDB till MSSQL Bronze-lager)
-ECHO ----------------------------------------------------------
-python "0_Load_Bronze_Data.py"
-IF %ERRORLEVEL% NEQ 0 (
-    ECHO FEL: 0_Load_Bronze_Data.py misslyckades!
-    GOTO :CLEANUP_AND_ERROR
-)
+
 
 ECHO.
 ECHO ----------------------------------------------------------

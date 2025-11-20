@@ -1,10 +1,11 @@
 """
 ================================================================
-JOBB 1.5: Kör Kundsegmentering (K-Means)
+JOBB 1.5: Kör Kundsegmentering (Business Logic / Quantiles)
 ================================================================
-*** UPPDATERAD (COMMIT FIX) ***
-- Lade till connection.commit() för att säkerställa att tabeller sparas.
-- Använder DROP/SELECT INTO för att skapa tabeller automatiskt.
+*** UPPDATERAD (LOGISK SEGMENTERING) ***
+- Ersätter K-Means med Kvantiler (Percentiler).
+- Garanterar att segmenten är logiska (Hög Volym ÄR faktiskt Hög Volym).
+- Behåller all annan logik (Sjukanmälan, Peaks, Commit).
 """
 
 import pandas as pd
@@ -13,12 +14,10 @@ from sqlalchemy import create_engine, text
 import config
 import sys
 import traceback
-from sklearn.cluster import KMeans
-from sklearn.preprocessing import StandardScaler
 from DataDriven_utils import add_all_features
 
 def create_and_save_segments():
-    print("--- Startar Jobb 1.5: Dynamisk Kundsegmentering (K-Means) [ROBUST-VERSION] ---")
+    print("--- Startar Jobb 1.5: Kundsegmentering (Business Logic) ---")
 
     try:
         mssql_engine = create_engine(config.MSSQL_CONN_STR)
@@ -76,40 +75,38 @@ def create_and_save_segments():
     df_segments = pd.merge(df_agg, df_peak[['CustomerKey', 'Peak_Pattern']], on=['CustomerKey'], how='left')
     df_segments['Peak_Pattern'] = df_segments['Peak_Pattern'].fillna('Oklart')
 
-    # === STEG 4: K-Means ===
-    print("-> Skapar segment (K-Means)...")
-    features_for_clustering = ['Total_Samtal', 'Genomsnittlig_AHT_Sek']
-    df_to_cluster = df_segments[df_segments['Total_Samtal'] > 0].copy()
+    # === STEG 4: SEGMENTERING (NY LOGIK: KVANTILER) ===
+    print("-> Skapar segment (Logiska Kvantiler)...")
     
-    if not df_to_cluster.empty:
-        scaler = StandardScaler()
-        df_scaled = scaler.fit_transform(df_to_cluster[features_for_clustering])
-        kmeans = KMeans(n_clusters=4, random_state=42, n_init=10)
-        df_to_cluster['Cluster'] = kmeans.fit_predict(df_scaled)
-        
-        model_inertia = kmeans.inertia_
-        print(f"-> K-Means Inertia: {model_inertia:.2f}")
-        
-        df_centroids = df_to_cluster.groupby('Cluster')[features_for_clustering].mean().reset_index()
-        df_centroids = df_centroids.sort_values(by='Total_Samtal')
-        low_vol_clusters = df_centroids.iloc[0:2]['Cluster'].tolist()
-        high_vol_clusters = df_centroids.iloc[2:4]['Cluster'].tolist()
-        cluster_map = {}
-        low_vol_df = df_centroids[df_centroids['Cluster'].isin(low_vol_clusters)].sort_values(by='Genomsnittlig_AHT_Sek')
-        cluster_map[low_vol_df.iloc[0]['Cluster']] = 'Låg-Volym_Korta-Ärenden'
-        cluster_map[low_vol_df.iloc[1]['Cluster']] = 'Låg-Volym_Långa-Ärenden'
-        high_vol_df = df_centroids[df_centroids['Cluster'].isin(high_vol_clusters)].sort_values(by='Genomsnittlig_AHT_Sek')
-        cluster_map[high_vol_df.iloc[0]['Cluster']] = 'Hög-Volym_Korta-Ärenden'
-        cluster_map[high_vol_df.iloc[1]['Cluster']] = 'Hög-Volym_Långa-Ärenden'
-        
-        df_to_cluster['Behavior_Segment'] = df_to_cluster['Cluster'].map(cluster_map)
-        df_segments = pd.merge(df_segments, df_to_cluster[['CustomerKey', 'Behavior_Segment']], on=['CustomerKey'], how='left')
-    else:
-        df_segments['Behavior_Segment'] = 'Okänt'
+    # Vi sätter gränserna baserat på verklig data
+    # Volym: De 20% största kunderna är "Hög Volym" (Pareto-ish)
+    vol_limit = df_segments['Total_Samtal'].quantile(0.80)
+    
+    # AHT: Medianen delar vad som är "Långt" eller "Kort"
+    aht_limit = df_segments['Genomsnittlig_AHT_Sek'].quantile(0.50)
 
-    df_segments['Behavior_Segment'] = df_segments['Behavior_Segment'].fillna('Okänt/Ingen Taltid')
+    print(f"   -> Gräns Hög Volym (Top 20%): > {vol_limit:.0f} samtal")
+    print(f"   -> Gräns Långa Ärenden (Median): > {aht_limit:.0f} sek")
 
-    # === STEG 5: Spara Dim_Customer_Behavior (MED COMMIT) ===
+    def get_segment(row):
+        # Specialfall: Sjukanmälan
+        if row['CustomerKey'] == 'INTERNAL_SICK':
+            return 'Segment_Sjukanmälan'
+        
+        # Logisk indelning
+        vol_label = 'Hög-Volym' if row['Total_Samtal'] > vol_limit else 'Låg-Volym'
+        aht_label = 'Långa-Ärenden' if row['Genomsnittlig_AHT_Sek'] > aht_limit else 'Korta-Ärenden'
+        
+        return f"{vol_label}_{aht_label}"
+
+    # Applicera logiken på varje rad
+    df_segments['Behavior_Segment'] = df_segments.apply(get_segment, axis=1)
+    
+    # Visa fördelning
+    print("   -> Segmentfördelning:")
+    print(df_segments['Behavior_Segment'].value_counts())
+
+    # === STEG 5: Spara Dim_Customer_Behavior ===
     output_table_name = config.TABLE_NAMES['Customer_Behavior_Dimension']
     staging_table_name = f"{output_table_name}_STAGING"
     final_cols = ['CustomerKey', 'Name', 'Total_Samtal', 'Genomsnittlig_AHT_Sek', 'Behavior_Segment']
@@ -119,22 +116,21 @@ def create_and_save_segments():
         print(f"-> Sparar till STAGING '{staging_table_name}'...")
         df_to_save.to_sql(staging_table_name, mssql_engine, if_exists='replace', index=False, chunksize=1000)
 
-        print(f"-> Flyttar till PROD '{output_table_name}' (Auto-Create)...")
+        print(f"-> Flyttar till PROD '{output_table_name}'...")
         sql_transaction = f"""
         IF OBJECT_ID('{output_table_name}', 'U') IS NOT NULL DROP TABLE [{output_table_name}];
         SELECT * INTO [{output_table_name}] FROM [{staging_table_name}];
         """
         with mssql_engine.connect() as connection:
             connection.execute(text(sql_transaction))
-            connection.commit() # <--- VIKTIG FIX: Bekräfta transaktionen!
-            
+            connection.commit() 
         print(f"-> KLART: '{output_table_name}' uppdaterad.")
 
     except Exception as e:
         print(f"FATALT FEL vid sparning av segment: {e}")
         sys.exit(1)
 
-    # === STEG 6: Peak Analysis (MED COMMIT) ===
+    # === STEG 6: Peak Analysis (Oförändrad, men bra att ha med) ===
     print("-> Analyserar månatliga topp-tider...")
     try:
         df_samtal = df_history_features[df_history_features['TalkTimeInSec'] > 0].copy()
@@ -149,7 +145,7 @@ def create_and_save_segments():
             df_samtal.loc[df_samtal['TalkTimeInSec'] > upper_limit, 'Samtalstyp'] = 'Långt'
 
             df_peak_monthly = df_samtal.groupby(
-                ['CustomerKey', 'Name', 'månad_namn', 'veckodag_namn', 'timme', 'Samtalstyp']
+                ['CustomerKey', 'Name', 'månad_namn', 'månad', 'veckodag_namn', 'veckodag', 'timme', 'Samtalstyp']
             ).agg(Antal_Samtal_Denna_Timme=('CallId', 'count')).reset_index()
 
             df_monthly_totals = df_peak_monthly.groupby(
@@ -174,7 +170,7 @@ def create_and_save_segments():
             peak_table_name = config.TABLE_NAMES.get('Monthly_Peak_Analysis', 'Dim_Customer_Monthly_Peaks')
             peak_staging_table_name = f"{peak_table_name}_STAGING"
 
-            print(f"-> Sparar peaks till STAGING '{peak_staging_table_name}'...")
+            print(f"-> Sparar peaks till STAGING...")
             df_top_peaks.to_sql(peak_staging_table_name, mssql_engine, if_exists='replace', index=False, chunksize=1000)
             
             print(f"-> Flyttar till PROD '{peak_table_name}'...")
@@ -184,13 +180,12 @@ def create_and_save_segments():
             """
             with mssql_engine.connect() as connection:
                 connection.execute(text(peak_sql_transaction))
-                connection.commit() # <--- VIKTIG FIX
+                connection.commit()
             
             print(f"-> KLART: '{peak_table_name}' sparad.")
 
     except Exception as e:
         print(f"VARNING: Kunde inte spara peak-tabellen: {e}")
-        # Ej kritiskt, fortsätt
         
     print("\n--- Kundsegmentering slutförd ---")
 

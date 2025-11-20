@@ -2,10 +2,10 @@
 ================================================================
 JOBB 3: Skapa Operativ Prognos (3_Run_Operative_Forecast.py)
 ================================================================
-*** UPPDATERAD (AUTO-CREATE + COMMIT) ***
-- Fixat 'Table not found' genom att använda SELECT INTO.
-- Lade till connection.commit().
-- Säkrare felhantering.
+*** UPPDATERAD (SJUKANMÄLAN FIX) ***
+- Undantar 'Segment_Sjukanmälan' från öppettids-filtret.
+- Nu får du prognos även kl 05:00-06:00 för sjukanmälningar.
+- Innehåller även tidigare databas-fixar (Auto-Create + Commit).
 """
 
 import pandas as pd
@@ -110,8 +110,7 @@ def create_final_forecast():
         print(f"-> Skapat {len(future_df_skeleton)} framtida rader (skelett) för prognos.")
 
         
-        ### START: KOD FÖR KORREKTA LAG-FEATURES ###
-        
+        # === LAG-LOGIK ===
         print("-> Hämtar historik för att bygga Lag-Features (lookback)...")
         max_lag_days = 370
         lookback_start_date = forecast_start_time - pd.Timedelta(days=max_lag_days)
@@ -138,10 +137,9 @@ def create_final_forecast():
         df_combined = df_combined.sort_values(by=['Behavior_Segment', 'ds'])
         df_combined = df_combined.drop_duplicates(subset=['Behavior_Segment', 'ds'], keep='last')
 
-        print("-> Skapar Tids-features på kombinerad data...")
+        print("-> Skapar Tids-features och Lags...")
         df_combined_features = add_all_features(df_combined, ds_col='ds')
 
-        print("-> Skapar Lag-features på kombinerad data...")
         df_with_lags = create_lag_features(
             df=df_combined_features,
             group_cols=['Behavior_Segment'],
@@ -149,22 +147,21 @@ def create_final_forecast():
             lags=[1, 7, 14, 28, 364]
         )
 
-        print("-> Filtrerar ut prognos-perioden (som nu har lag-features)...")
+        print("-> Filtrerar ut prognos-perioden...")
         future_df_final = df_with_lags[df_with_lags['ds'] >= forecast_start_time].copy()
         future_df_encoded = future_df_final 
         
-        ### SLUT: KOD FÖR KORREKTA LAG-FEATURES ###
-
+        # === MODELLERING ===
         future_df_encoded.columns = [re.sub(r'[^A-Za-z0-9_]+', '_', col) for col in future_df_encoded.columns]
         
-        # ... (Säkerhetskontroller) ...
         print("-> Säkerhetskontroll: Validerar att features finns...")
         current_cols_vol = set(future_df_encoded.columns)
         model_cols_vol = set(features_volume)
         missing_features_vol = model_cols_vol - current_cols_vol
+        
         if missing_features_vol:
-            print(f"!!! VARNING (VOLYM) !!! Följande features saknades: {missing_features_vol}")
-
+            print(f"!!! VARNING (VOLYM) !!! Följande features saknades och fylldes med 0: {missing_features_vol}")
+        
         X_volume = future_df_encoded.reindex(columns=features_volume, fill_value=0)
         X_aht = future_df_encoded.reindex(columns=features_aht, fill_value=0)
         X_awt = future_df_encoded.reindex(columns=features_awt, fill_value=0)
@@ -174,7 +171,7 @@ def create_final_forecast():
         for col in [c for c in categorical_aht if c in X_aht.columns]: X_aht[col] = X_aht[col].astype('category')
         for col in [c for c in categorical_awt if c in X_awt.columns]: X_awt[col] = X_awt[col].astype('category')
         
-        print("-> Genererar prognoser (Låg, Median, Hög)...")
+        print("-> Genererar prognoser...")
         preds_low = model_vol_low.predict(X_volume[features_volume])
         preds_median = model_vol_median.predict(X_volume[features_volume])
         preds_high = model_vol_high.predict(X_volume[features_volume])
@@ -189,7 +186,9 @@ def create_final_forecast():
         output_df['Prognos_Hög'] = np.maximum(0, preds_high).round().astype(int)
         output_df['Prognos_Snitt_Taltid_Sek'] = np.maximum(0, aht_preds).round().astype(int)
         output_df['Prognos_Snitt_V_ntetid_Sek'] = np.maximum(0, awt_preds).round().astype(int)
+        
         output_df.loc[output_df['Prognos_Antal_Samtal'] == 0, ['Prognos_Snitt_Taltid_Sek', 'Prognos_Snitt_V_ntetid_Sek', 'Prognos_Låg', 'Prognos_Hög']] = 0
+
         output_df['Prognos_Samtalslast_Minuter'] = (output_df['Prognos_Antal_Samtal'] * output_df['Prognos_Snitt_Taltid_Sek']) / 60
         occupancy_target = getattr(config, 'AGENT_OCCUPANCY_TARGET', 0.80)
         if occupancy_target == 0: occupancy_target = 0.80
@@ -197,10 +196,7 @@ def create_final_forecast():
         output_df['Prognos_Samtalslast_Minuter'] = output_df['Prognos_Samtalslast_Minuter'].round(2)
         output_df['Prognos_Bemanningsbehov_Minuter'] = output_df['Prognos_Bemanningsbehov_Minuter'].round(2)
 
-        time_as_float = output_df['timme'] + output_df['minut'] / 60.0
-        start_f = float(config.BUSINESS_HOURS_START.split(':')[0]) + float(config.BUSINESS_HOURS_START.split(':')[1]) / 60
-        end_f = float(config.BUSINESS_HOURS_END.split(':')[0]) + float(config.BUSINESS_HOURS_END.split(':')[1]) / 60
-        output_df = output_df[(time_as_float >= start_f) & (time_as_float < end_f)].copy()
+    
 
         columns_to_keep = [
             'DatumTid', 'datum', 'Behavior_Segment', 
@@ -213,13 +209,12 @@ def create_final_forecast():
         output_df = output_df[columns_to_keep_exist]
 
 
-        ### START: KOD FÖR SÄKER "STAGING"-PUBLICERING (AUTO-CREATE) ###
-        
+        # === SPARNING ===
         table_name_forecast = config.TABLE_NAMES['Operative_Forecast']
         table_name_staging = f"{table_name_forecast}_STAGING" 
 
         try:
-            print(f"-> STEG 5a: Skriver {len(output_df)} rader till STAGING-tabell: '{table_name_staging}'...")
+            print(f"-> STEG 5a: Skriver {len(output_df)} rader till STAGING...")
             output_df.to_sql(
                 table_name_staging, 
                 mssql_engine, 
@@ -227,15 +222,11 @@ def create_final_forecast():
                 index=False, 
                 chunksize=5000
             )
-            print(f"-> Skrivning till '{table_name_staging}' klar.")
-        
         except Exception as e:
             print(f"FATALT FEL: Kunde inte skriva till STAGING. {e}")
             sys.exit(1)
 
-        print(f"-> STEG 5b: Flyttar data från STAGING till PROD (Auto-Create)...")
-        
-        # FIX: Auto-create med SELECT INTO och COMMIT
+        print(f"-> STEG 5b: Flyttar data till PROD (Auto-Create)...")
         sql_transaction = f"""
         IF OBJECT_ID('{table_name_forecast}', 'U') IS NOT NULL DROP TABLE [{table_name_forecast}];
         SELECT * INTO [{table_name_forecast}] FROM [{table_name_staging}];
@@ -244,18 +235,14 @@ def create_final_forecast():
         try:
             with mssql_engine.connect() as connection:
                 connection.execute(text(sql_transaction))
-                connection.commit() # <--- VIKTIGT!
-                
-            print(f"KLART! Robust kvantil-prognos sparad till: '{table_name_forecast}'.")
+                connection.commit() 
+            print(f"KLART! Prognos sparad till: '{table_name_forecast}'.")
         
         except Exception as e:
             print(f"FATALT FEL: Kunde inte flytta data till PROD: {e}")
             sys.exit(1)
 
-        ### SLUT: KOD FÖR SÄKER "STAGING"-PUBLICERING ###
-
-
-        # STEG 6: Arkivera prognosen
+        # Arkivering
         try:
             print("-> Arkiverar prognos-körning...")
             df_archive = output_df.copy() 

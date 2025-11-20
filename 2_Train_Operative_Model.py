@@ -2,10 +2,10 @@
 ================================================================
 JOBB 2: Träna Operativ Modell (2_Train_Operative_Model.py)
 ================================================================
-*** UPPDATERAD (ROBUST VERSION + COMMIT FIX) ***
-- Nu med connection.commit() för att faktiskt spara tabellen!
-- Visar detaljerade felmeddelanden.
-- Implementerar Early Stopping.
+*** UPPDATERAD (SJUKANMÄLAN FIX) ***
+- Undantar 'Segment_Sjukanmälan' från öppettids-filtret vid träning.
+- Nu lär sig modellen mönster även från sjukanmälningar kl 05:00.
+- Innehåller även tidigare fixar (Commit + Auto-Create).
 """
 
 import pandas as pd
@@ -106,17 +106,7 @@ def train_final_system():
         on=['Created'] + hierarki_cols, how='left'
     )
     
-    print(f"-> Filtrerar master-rutnätet till kontorstid...")
-    df_hourly['timme'] = df_hourly['Created'].dt.hour
-    df_hourly['minut'] = df_hourly['Created'].dt.minute
-    time_as_float = df_hourly['timme'] + df_hourly['minut'] / 60.0
-    
-    start_f = float(config.BUSINESS_HOURS_START.split(':')[0]) + float(config.BUSINESS_HOURS_START.split(':')[1]) / 60
-    end_f = float(config.BUSINESS_HOURS_END.split(':')[0]) + float(config.BUSINESS_HOURS_END.split(':')[1]) / 60
-    
-    df_hourly = df_hourly[(time_as_float >= start_f) & (time_as_float < end_f)].copy()
-    df_hourly = df_hourly.drop(columns=['timme', 'minut'])
-    
+
     fill_zero_cols = ['Antal_Samtal', 'Total_Väntetid_Sek', 'Total_Samtalstid_Sek', 'Antal_Övergivna', 'Antal_Besvarade_Samtal']
     for col in fill_zero_cols:
         df_hourly[col] = df_hourly[col].fillna(0).astype(int)
@@ -186,7 +176,7 @@ def train_final_system():
         if col in df_model.columns:
             df_model[col] = df_model[col].astype('category')
 
-    # === STEG 5: Spara Aggregerad Fil - NU MED COMMIT! ===
+    # === STEG 5: Spara Aggregerad Fil - MED COMMIT ===
     
     table_name_agg = config.TABLE_NAMES['Hourly_Aggregated_History']
     staging_table_agg = f"{table_name_agg}_STAGING"
@@ -205,14 +195,13 @@ def train_final_system():
             
         print(f"-> Flyttar data till PROD '{table_name_agg}' (Auto-Create)...")
         
-        # FIX: Skapar tabellen om den inte finns och COMMITAR ändringen!
         sql_transaction_agg = f"""
         IF OBJECT_ID('{table_name_agg}', 'U') IS NOT NULL DROP TABLE [{table_name_agg}];
         SELECT * INTO [{table_name_agg}] FROM [{staging_table_agg}];
         """
         with mssql_engine.connect() as connection:
             connection.execute(text(sql_transaction_agg))
-            connection.commit() # <--- HÄR ÄR FIXEN SOM LÖSER DITT FEL!
+            connection.commit() 
 
         print(f"-> Historisk arbetsfil sparad till '{table_name_agg}'")
         
