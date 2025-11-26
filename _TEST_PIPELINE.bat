@@ -42,55 +42,39 @@ ECHO KOR PIPELINE...
 ECHO ==========================================================
 
 
-ECHO.
-ECHO ----------------------------------------------------------
-ECHO Steg 1: Kor 1_Extract_Operative_Data.py...
-ECHO ----------------------------------------------------------
-python "1_Extract_Operative_Data.py"
-IF %ERRORLEVEL% NEQ 0 (
-    ECHO FEL: 1_Extract_Operative_Data.py misslyckades!
-    GOTO :CLEANUP_AND_ERROR
-)
 
 ECHO.
 ECHO ----------------------------------------------------------
-ECHO Steg 1.5: Kor 1.5_Run_Customer_Segmentation.py (K-Means)...
+ECHO ...
 ECHO ----------------------------------------------------------
-python "1.5_Run_Customer_Segmentation.py"
+
+python "Debug-steg-for-steg.py"
+
 IF %ERRORLEVEL% NEQ 0 (
-    ECHO FEL: 1.5_Run_Customer_Segmentation.py misslyckades!
+
+    ECHO  misslyckades!
+
     GOTO :CLEANUP_AND_ERROR
+
 )
 
-ECHO.
-ECHO ----------------------------------------------------------
-ECHO Steg 2: Kor 2_Train_Operative_Model.py...
-ECHO ----------------------------------------------------------
-python "2_Train_Operative_Model.py"
-IF %ERRORLEVEL% NEQ 0 (
-    ECHO FEL: 2_Train_Operative_Model.py misslyckades!
-    GOTO :CLEANUP_AND_ERROR
-)
 
 ECHO.
 ECHO ----------------------------------------------------------
 ECHO Steg 3: Kor 3_Run_Operative_Forecast.py (med arkivering)...
 ECHO ----------------------------------------------------------
+
 python "3_Run_Operative_Forecast.py"
+
 IF %ERRORLEVEL% NEQ 0 (
+
     ECHO FEL: 3_Run_Operative_Forecast.py misslyckades!
+
     GOTO :CLEANUP_AND_ERROR
+
 )
 
-ECHO.
-ECHO ----------------------------------------------------------
-ECHO Steg 4: Kor C_Sync_Raw_Cases.py...
-ECHO ----------------------------------------------------------
-python "C_Sync_Raw_Cases.py"
-IF %ERRORLEVEL% NEQ 0 (
-    ECHO FEL: C_Sync_Raw_Cases.py misslyckades!
-    GOTO :CLEANUP_AND_ERROR
-)
+
 
 ECHO ----------------------------------------------------------
 ECHO Steg 5: Kor 4_evaluate_forcast.py (Feedback-loop)...

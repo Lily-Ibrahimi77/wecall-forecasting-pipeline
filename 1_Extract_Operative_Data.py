@@ -1,11 +1,10 @@
 """
 ================================================================
-JOBB 1: Extrahera Data (FRÅN BRONZE)
+JOBB 1: Extrahera & Tvätta Operativ Data (1_Extract_Operative_Data.py)
 ================================================================
-*** UPPDATERAD (MED SJUKANMÄLAN-TAGGNING) ***
-- Läser från MSSQL (Bronze).
-- Taggar manuellt upp sjukanmälningsnumret till 'INTERNAL_SICK'.
-- Detta garanterar att det inte blir 'Okänd' och försvinner.
+*** SJUKANMÄLAN-TAGGNING & REDIAL-BERÄKNING ***
+- Matchning: Använder original .str.strip() för att garantera kundmatchning.
+- Redial: Använder 'CallerNr' för korrekt analys.
 """
 
 import os
@@ -56,7 +55,6 @@ def update_dim_queue(mssql_engine):
         print(f"-> KLART: 'Dim_Queue' har uppdaterats.")
     except Exception as e:
         print(f"FEL: Kunde inte uppdatera 'Dim_Queue': {e}")
-        traceback.print_exc()
         sys.exit(1)
 
 def update_dim_customer_and_phone(mssql_engine, df_clean_call_data):
@@ -70,8 +68,7 @@ def update_dim_customer_and_phone(mssql_engine, df_clean_call_data):
         customer_cols_raw = ['CustomerId', 'Name', 'CustomerKey', 'ParentId', 'ParentName', 'BillingType', 'är_dotterbolag', 'LandingNumber']
         customer_cols = [col for col in customer_cols_raw if col in df_clean_call_data.columns]
         
-        subset_key = 'CustomerKey' 
-        df_dim_customer = df_clean_call_data[customer_cols].drop_duplicates(subset=[subset_key])
+        df_dim_customer = df_clean_call_data[customer_cols].drop_duplicates(subset=['CustomerKey'])
         
         customer_table_name = config.TABLE_NAMES['Customer_Dimension']
         customer_staging_table = f"{customer_table_name}_STAGING"
@@ -91,9 +88,14 @@ def update_dim_customer_and_phone(mssql_engine, df_clean_call_data):
         # === DEL 2: Dim_Phone_Lookup ===
         phone_cols_raw = ['CustomerId', 'LandingNumber', 'CustomerKey']
         phone_cols = [col for col in phone_cols_raw if col in df_clean_call_data.columns]
+        
         df_phone_base = df_clean_call_data[phone_cols].dropna(subset=['LandingNumber'])
-        df_phone_list = df_phone_base.assign(LandingNumber=df_phone_base['LandingNumber'].str.split(','))
+        
+        # Original-logik för listor (Säkerhet)
+        df_phone_list = df_phone_base.assign(LandingNumber=df_phone_base['LandingNumber'].astype(str).str.split(','))
         df_phone_lookup = df_phone_list.explode('LandingNumber').reset_index(drop=True)
+        
+        # Original tvätt
         df_phone_lookup['LandingNumber'] = df_phone_lookup['LandingNumber'].str.strip()
         df_phone_lookup = df_phone_lookup[df_phone_lookup['LandingNumber'] != '']
         df_phone_lookup = df_phone_lookup.drop_duplicates()
@@ -120,27 +122,24 @@ def update_dim_customer_and_phone(mssql_engine, df_clean_call_data):
 
 
 def clean_and_export_call_data():
-    print(f"Startar skript för datainsamling (BRONZE -> SILVER)...")
+    print(f"Startar skript för datainsamling (BRONZE -> SILVER) - REDIAL V2 (Samma Kö)...")
     try:
         mssql_engine = create_engine(config.MSSQL_CONN_STR)
-        print("-> Ansluten till MSSQL.")
     except Exception as e:
         print(f"FATALT FEL: {e}")
         return None, None
 
-    # === STEG 1: Ladda filter ===
+    # === STEG 1 & 2: Ladda filter & Kunder ===
     try:
         exclude_df = pd.read_csv(config.EXCLUDE_NUMBERS_FILE, dtype={'LandingNumber': str})
         nummer_att_exkludera = exclude_df['LandingNumber'].str.strip().tolist()
-        print(f"-> Laddade {len(nummer_att_exkludera)} nummer att exkludera.")
     except FileNotFoundError:
-        print(f"-> Info: Filen '{config.EXCLUDE_NUMBERS_FILE}' saknas, inga nummer exkluderas.")
         nummer_att_exkludera = []
 
-    # === STEG 2: Hämta Kund-mappning ===
     try:
         df_customer_mapping = get_customer_data(engine=mssql_engine)
         if df_customer_mapping is None: raise Exception("Ingen kunddata.")
+        df_customer_mapping['LandingNumber'] = df_customer_mapping['LandingNumber'].astype(str).str.strip()
     except Exception as e:
         print(f"FATALT FEL: {e}")
         return None, None
@@ -148,7 +147,10 @@ def clean_and_export_call_data():
     # === STEG 3: Datum ===
     true_today = get_last_date_from_source(mssql_engine)
     if config.RUN_MODE == 'VALIDATION':
-        today = pd.to_datetime(config.VALIDATION_SETTINGS.get('TRAINING_END_DATE')) + relativedelta(days=1)
+        if 'EVALUATION_END_DATE' in config.VALIDATION_SETTINGS:
+            today = pd.to_datetime(config.VALIDATION_SETTINGS['EVALUATION_END_DATE']) + relativedelta(days=1)
+        else:
+            today = pd.to_datetime(config.VALIDATION_SETTINGS['TRAINING_END_DATE']) + relativedelta(days=1)
     else:
         today = true_today
 
@@ -159,124 +161,113 @@ def clean_and_export_call_data():
 
     print(f"-> Bearbetar data: {start_date} till {end_date}.")
 
-    # === STEG 4: SQL (Med SJUKANMÄLAN-logik i WHERE) ===
+    # === STEG 4: SQL ===
     exclude_queues_str = ", ".join([f"'{str(qid)}'" for qid in config.EXCLUDE_QUEUE_IDS])
     bronze_cdr = config.BRONZE_TABLES['cdr']
-    
-    # Hämtar sjukanmälningsnumret säkert
-    sick_number = getattr(config, 'SICK_LEAVE_NUMBER', 'XXXXXXXXXX')
 
     query = f"""
         WITH CallData AS (
             SELECT * FROM [{bronze_cdr}]
             WHERE Created BETWEEN '{start_date}' AND '{end_date}'
-            -- TIDSFILTER BORTTAGET HÄR! Vi tar allt dygnet runt.
         ),
         CalculatedMetrics AS (
             SELECT
                 CallId, Status, Created, LandingNumber, ChannelType, QueueId,
+                callerNr,
                 TalkTimeInSec, Duration, CaseId,
-                SUM(TalkTimeInSec) OVER (PARTITION BY CallId) as TotalTalkTime,
-                MAX(Duration) OVER (PARTITION BY CallId) as TotalDuration,
-                MAX(CaseId) OVER (PARTITION BY CallId) as CaseId_Fixed,
                 FIRST_VALUE(QueueId) OVER (PARTITION BY CallId ORDER BY Created ASC) as First_QueueId,
                 FIRST_VALUE(Created) OVER (PARTITION BY CallId ORDER BY Created ASC) as First_Created,
                 FIRST_VALUE(LandingNumber) OVER (PARTITION BY CallId ORDER BY Created ASC) as First_LandingNumber,
+                FIRST_VALUE(callerNr) OVER (PARTITION BY CallId ORDER BY Created ASC) as First_CallerNr,
                 FIRST_VALUE(ChannelType) OVER (PARTITION BY CallId ORDER BY Created ASC) as First_ChannelType,
                 LAST_VALUE(Status) OVER (PARTITION BY CallId ORDER BY Created ASC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as Last_Status,
                 ROW_NUMBER() OVER (PARTITION BY CallId ORDER BY Created ASC) as rn_first
             FROM CallData
         )
         SELECT
-            CallId, First_Created AS Created, First_LandingNumber AS LandingNumber,
-            First_ChannelType AS ChannelType, First_QueueId AS QueueId, CaseId_Fixed AS CaseId,
-            Last_Status AS Status, TotalDuration AS Duration, TotalTalkTime AS TalkTimeInSec
+            CallId, First_Created AS Created, First_LandingNumber AS LandingNumber, First_CallerNr AS CallerNr,
+            First_ChannelType AS ChannelType, First_QueueId AS QueueId, CaseId,
+            Last_Status AS Status, Duration, TalkTimeInSec
         FROM CalculatedMetrics
         WHERE rn_first = 1 AND First_QueueId NOT IN ({exclude_queues_str})
     """
     
-    # === STEG 5: Hämta & Koppla ===
     try:
         df_all_calls = pd.read_sql(query, mssql_engine)
         if df_all_calls.empty: return None, None
             
         df_all_calls['Created'] = pd.to_datetime(df_all_calls['Created']).dt.tz_localize(None)
-        df_all_calls['LandingNumber'] = df_all_calls['LandingNumber'].str.strip()
+        df_all_calls['LandingNumber'] = df_all_calls['LandingNumber'].astype(str).str.strip()
         
-        # Filter: Ta bort spärrade nummer (OBS: Se till att SICK_NUMBER inte är i csv-filen!)
         df_clean = df_all_calls[~df_all_calls['LandingNumber'].isin(nummer_att_exkludera)]
         df_clean = df_clean[df_clean['LandingNumber'] != '']
         
-        # Merge: Koppla på namn
-        print("-> Kopplar på kundnamn...")
         df_enriched = pd.merge(df_clean, df_customer_mapping, on='LandingNumber', how='left')
         
-        # --- HÄR ÄR KODEN SOM SAKNADES: MANUELL TAGGNING ---
-        mask_sick = df_enriched['LandingNumber'] == sick_number
-        if mask_sick.any():
-            print(f"-> Identifierade {mask_sick.sum()} sjukanmälningar! Taggar som 'INTERNAL_SICK'.")
-            df_enriched.loc[mask_sick, 'Name'] = 'Intern Sjukanmälan'
-            df_enriched.loc[mask_sick, 'CustomerKey'] = 'INTERNAL_SICK'
-            df_enriched.loc[mask_sick, 'TjänstTyp'] = 'Personal'
-        # ---------------------------------------------------
-
-        # Analys: Okända (Nu kommer sjukanmälan INTE att synas här)
-        print("\n--- ANALYS: OKÄNDA NUMMER ---")
-        unknowns = df_enriched[df_enriched['Name'].isna()]
-        if not unknowns.empty:
-            print(f"Hittade {len(unknowns)} okända samtal.")
-            unknowns['LandingNumber'].value_counts().head(20).to_csv("Unknown_Numbers_Audit.csv")
-        else:
-            print("Alla nummer matchades!")
-        print("-------------------------------\n")
-
-        # Filter Namn (Städning)
-        if hasattr(config, 'EXCLUDE_CUSTOMER_NAMES_LIKE') and config.EXCLUDE_CUSTOMER_NAMES_LIKE:
-            for name_to_exclude in config.EXCLUDE_CUSTOMER_NAMES_LIKE:
-                clean_name = name_to_exclude.replace('%', '')
-                df_enriched = df_enriched[~df_enriched['Name'].fillna('').str.contains(clean_name, case=False)]
-        
-        # Fyll i resterande hål
         df_enriched['är_dotterbolag'] = (~df_enriched['ParentId'].isin([0, pd.NA, np.nan, None, ''])).astype(int)
-        df_enriched['är_dotterbolag'] = df_enriched['är_dotterbolag'].fillna(0).astype(int)
         df_enriched['Name'] = df_enriched['Name'].fillna('Okänd Kund')
         df_enriched['CustomerKey'] = df_enriched['CustomerKey'].fillna('Okänd')
         df_enriched['TjänstTyp'] = df_enriched['QueueId'].apply(map_queue_to_service)
-
-        # === STEG 6 & 7: Spara ===
         
-        # Abandoned
+        # === REDIAL LOGIK (V2: SAMMA KÖ & STRIKT NUMMER) ===
+        print("-> Beräknar Redial (Krav: Samma Kö & < 5 min)...")
+        
+        # 1. Tvätta nummer
+        df_enriched['CallerNr_Clean'] = df_enriched['CallerNr'].astype(str).str.replace(r'\D', '', regex=True)
+        
+        # 2. Sortera
+        df_enriched = df_enriched.sort_values(by=['CallerNr_Clean', 'Created']).reset_index(drop=True)
+        
+        # 3. Hämta FÖREGÅENDE data för samma nummer
+        df_enriched['Prev_Created'] = df_enriched.groupby('CallerNr_Clean')['Created'].shift(1)
+        df_enriched['Prev_Status'] = df_enriched.groupby('CallerNr_Clean')['Status'].shift(1)
+        df_enriched['Prev_QueueId'] = df_enriched.groupby('CallerNr_Clean')['QueueId'].shift(1)
+        
+        df_enriched['Time_Diff_Sec'] = (df_enriched['Created'] - df_enriched['Prev_Created']).dt.total_seconds()
+
+        REDIAL_THRESHOLD_SEC = getattr(config, 'REDIAL_THRESHOLD_SEC', 300)
+        df_enriched['is_redial'] = 0
+        
+        # 4. Logik:
+        # - Giltigt nummer (> 6 siffror)
+        # - Inom 5 minuter
+        # - Föregående var 'callabandoned'
+        # - OCH: Det är SAMMA KÖ (QueueId == Prev_QueueId)
+        
+        is_valid_number = (df_enriched['CallerNr_Clean'].str.len() >= 7)
+        is_short_time = (df_enriched['Time_Diff_Sec'] <= REDIAL_THRESHOLD_SEC) & (df_enriched['Time_Diff_Sec'] > 0)
+        was_abandoned = df_enriched['Prev_Status'].str.lower() == 'callabandoned'
+        is_same_queue = (df_enriched['QueueId'] == df_enriched['Prev_QueueId'])
+        
+        df_enriched.loc[is_valid_number & is_short_time & was_abandoned & is_same_queue, 'is_redial'] = 1
+        
+        print(f"-> Identifierade {df_enriched['is_redial'].sum()} äkta återuppringningar.")
+        
+        # Städa
+        df_enriched.drop(columns=['Prev_Created', 'Time_Diff_Sec', 'Prev_Status', 'Prev_QueueId', 'CallerNr_Clean'], inplace=True)
+
+        # === SPARA ===
+        # Abandoned Report
         df_abandoned = df_enriched[df_enriched['Status'].str.lower() == 'callabandoned'].copy()
         df_abandoned['Datum'] = df_abandoned['Created'].dt.date
-        report_start_date = end_date_dt - relativedelta(days=30)
-        df_abandoned = df_abandoned[df_abandoned['Created'] >= report_start_date]
-        
-        try:
-            tn_ab = config.TABLE_NAMES['Abandoned_Calls_Report']
-            st_ab = f"{tn_ab}_STAGING"
-            cols_ab = ['CallId', 'Created', 'Datum', 'LandingNumber', 'Name', 'CustomerKey', 'TjänstTyp', 'ParentId', 'Duration', 'QueueId']
-            cols_ab_exist = [c for c in cols_ab if c in df_abandoned.columns]
-            df_abandoned[cols_ab_exist].to_sql(st_ab, mssql_engine, if_exists='replace', index=False, chunksize=1000)
-            with mssql_engine.connect() as conn:
-                conn.execute(text(f"IF OBJECT_ID('{tn_ab}', 'U') IS NOT NULL DROP TABLE [{tn_ab}]; SELECT * INTO [{tn_ab}] FROM [{st_ab}];"))
-                conn.commit()
-        except Exception as e: print(f"Varning Abandoned: {e}")
+        tn_ab = config.TABLE_NAMES['Abandoned_Calls_Report']
+        df_abandoned.to_sql(f"{tn_ab}_STAGING", mssql_engine, if_exists='replace', index=False)
+        with mssql_engine.connect() as conn:
+            conn.execute(text(f"IF OBJECT_ID('{tn_ab}', 'U') IS NOT NULL DROP TABLE [{tn_ab}]; SELECT * INTO [{tn_ab}] FROM [{tn_ab}_STAGING];"))
+            conn.commit()
 
         # Main Data
         tn_train = config.TABLE_NAMES['Operative_Training_Data']
-        st_train = f"{tn_train}_STAGING"
-        final_cols = ['CallId', 'CaseId', 'Created', 'Status', 'Duration', 'TalkTimeInSec', 'ChannelType', 'LandingNumber', 'QueueId', 'Name', 'CustomerKey', 'är_dotterbolag', 'TjänstTyp']
-        final_cols_exist = [col for col in final_cols if col in df_enriched.columns]
-        df_save = df_enriched[final_cols_exist].copy()
+        final_cols = ['CallId', 'CaseId', 'Created', 'Status', 'Duration', 'TalkTimeInSec', 'ChannelType', 'LandingNumber', 'CallerNr', 'QueueId', 'Name', 'CustomerKey', 'är_dotterbolag', 'TjänstTyp', 'is_redial']
+        df_save = df_enriched[[c for c in final_cols if c in df_enriched.columns]].copy()
         df_save['Datum'] = df_save['Created'].dt.date
         
-        print(f"-> Sparar {len(df_save)} rader till STAGING...")
-        df_save.to_sql(st_train, mssql_engine, if_exists='replace', index=False, chunksize=5000)
+        print(f"-> Sparar {len(df_save)} rader till {tn_train}...")
+        df_save.to_sql(f"{tn_train}_STAGING", mssql_engine, if_exists='replace', index=False, chunksize=5000)
         with mssql_engine.connect() as conn:
-            conn.execute(text(f"IF OBJECT_ID('{tn_train}', 'U') IS NOT NULL DROP TABLE [{tn_train}]; SELECT * INTO [{tn_train}] FROM [{st_train}];"))
+            conn.execute(text(f"IF OBJECT_ID('{tn_train}', 'U') IS NOT NULL DROP TABLE [{tn_train}]; SELECT * INTO [{tn_train}] FROM [{tn_train}_STAGING];"))
             conn.commit()
 
-        print(f"KLART! Data sparad i: {tn_train}")
         return df_enriched, mssql_engine
 
     except Exception as e:
@@ -286,7 +277,6 @@ def clean_and_export_call_data():
 
 if __name__ == '__main__':
     df_clean_data, engine = clean_and_export_call_data()
-    
     if engine and df_clean_data is not None:
         update_dim_customer_and_phone(mssql_engine=engine, df_clean_call_data=df_clean_data) 
         update_dim_queue(mssql_engine=engine)

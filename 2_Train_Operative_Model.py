@@ -1,11 +1,9 @@
 """
 ================================================================
-JOBB 2: Träna Operativ Modell (2_Train_Operative_Model.py)
+JOBB 2: Träna Operativ Modell
 ================================================================
-*** UPPDATERAD (SJUKANMÄLAN FIX) ***
-- Undantar 'Segment_Sjukanmälan' från öppettids-filtret vid träning.
-- Nu lär sig modellen mönster även från sjukanmälningar kl 05:00.
-- Innehåller även tidigare fixar (Commit + Auto-Create).
+- Sparar 'cat_dtypes' i modellen. Detta är nyckeln för att prognosen
+  ska förstå att "Kundtjänst" är samma sak som "Kundtjänst".
 """
 
 import pandas as pd
@@ -14,294 +12,164 @@ import lightgbm as lgb
 import pickle
 import os
 from DataDriven_utils import add_all_features, create_lag_features 
-from datetime import datetime
 import config
 from sqlalchemy import create_engine, text
 import sys
-import traceback
 import re
 
 def train_final_system():
-    print("--- Startar ROBUST hierarkisk träning (per SEGMENT) ---")
-
+    print("--- Startar TRÄNING (KATEGORI FIX) ---")
     try:
         mssql_engine = create_engine(config.MSSQL_CONN_STR)
-        print("-> Ansluten till MSSQL Data Warehouse.")
     except Exception as e:
-        print(f"FATALT FEL: Kunde inte ansluta till MSSSQL: {e}")
+        print(f"FATALT FEL: {e}")
         sys.exit(1)
 
-    # ... (STEG 1: Läs in Rå-historik) ...
+    # 1. Läs data
     table_name_training = config.TABLE_NAMES['Operative_Training_Data']
-    print(f"-> Läser in rå-historik från '{table_name_training}'...")
-    
-    try:
-        cols_to_use = ['CallId', 'Created', 'Status', 'Duration', 'TalkTimeInSec', 'ChannelType', 'CustomerKey']
-        cols_str = ", ".join([f'[{col}]' for col in cols_to_use if col is not None])
-        sql_query = f'SELECT {cols_str} FROM [{table_name_training}]'
-        df_raw = pd.read_sql(sql_query, mssql_engine)
-    except Exception as e:
-        print(f"FEL: Kunde inte läsa data från '{table_name_training}'.")
-        print(f"Tekniskt fel: {e}")
-        sys.exit(1)
-
-    # ... (STEG 1.5: Läs in Segment och slå ihop) ...
-    table_name_segments = config.TABLE_NAMES['Customer_Behavior_Dimension']
-    print(f"-> Läser in kundsegment från '{table_name_segments}'...")
-    try:
-        sql_query_segments = f"SELECT CustomerKey, Behavior_Segment FROM [{table_name_segments}]"
-        df_segments = pd.read_sql(sql_query_segments, mssql_engine)
-        
-        if df_segments.empty:
-            print(f"VARNING: Tabellen '{table_name_segments}' är tom! Körde 1.5 korrekt?")
-            sys.exit(1)
-            
-    except Exception as e:
-        print(f"FEL: Kunde inte läsa segment från '{table_name_segments}'.")
-        print(f"Tekniskt fel: {e}")
-        sys.exit(1)
-        
-    print(f"-> Läste {len(df_raw)} samtal och {len(df_segments)} kundsegment.")
+    print(f"-> Läser data från {table_name_training}...")
+    sql_query = f'''
+        SELECT [Created], [CustomerKey], [TjänstTyp], [ChannelType], 
+               [TalkTimeInSec], [Duration], [Status]
+        FROM [{table_name_training}] 
+        WHERE [ChannelType] = 'call'
+    '''
+    df_raw = pd.read_sql(sql_query, mssql_engine)
     df_raw['Created'] = pd.to_datetime(df_raw['Created']).dt.tz_localize(None)
-    df_filtered = df_raw[df_raw['ChannelType'].str.lower() == 'call'].copy()
-    df_filtered['is_abandoned'] = (df_filtered['Status'].str.lower() == 'callabandoned').astype(int)
-    df_filtered['is_answered'] = (1 - df_filtered['is_abandoned'])
     
-    df_enriched = pd.merge(df_filtered, df_segments, on=['CustomerKey'], how='left')
-    df_enriched['Behavior_Segment'] = df_enriched['Behavior_Segment'].fillna('Okänt')
-    print("-> Samtalsdata berikad med segment.")
+    # Tvätta text
+    df_raw['TjänstTyp'] = df_raw['TjänstTyp'].astype(str).str.strip()
 
-    # ... (STEG 2: Aggregera och skapa rutnät) ...
-    print("-> Aggregerar data per (Timme, Segment)...")
-    group_keys = [ pd.Grouper(key='Created', freq='h'), 'Behavior_Segment' ]
-    df_hourly_sparse = df_enriched.groupby(group_keys).agg(
-        Antal_Samtal=('CallId', 'count'),
-        Total_Väntetid_Sek=('Duration', 'sum'),
+    df_raw['is_abandoned'] = (df_raw['Status'].str.lower() == 'callabandoned').astype(int)
+    df_raw['is_answered'] = (1 - df_raw['is_abandoned'])
+    df_raw['WaitTime'] = (df_raw['Duration'] - df_raw['TalkTimeInSec']).clip(lower=0)
+
+    # Segment
+    table_name_segments = config.TABLE_NAMES['Customer_Behavior_Dimension']
+    try:
+        df_segments = pd.read_sql(f"SELECT CustomerKey, Behavior_Segment FROM [{table_name_segments}]", mssql_engine)
+        df_enriched = pd.merge(df_raw, df_segments, on=['CustomerKey'], how='left')
+        df_enriched['Behavior_Segment'] = df_enriched['Behavior_Segment'].fillna('Okänt').astype(str).str.strip()
+    except:
+        df_enriched = df_raw.copy()
+        df_enriched['Behavior_Segment'] = 'Okänt'
+
+    # Aggregera
+    print("-> Aggregerar till (Timme, TjänstTyp, Segment)...")
+    df_hourly_agg = df_enriched.groupby([
+        pd.Grouper(key='Created', freq='h'), 'TjänstTyp', 'Behavior_Segment'
+    ]).agg(
+        Antal_Samtal=('Created', 'count'),
         Total_Samtalstid_Sek=('TalkTimeInSec', 'sum'),
-        Antal_Övergivna=('is_abandoned', 'sum'),
+        Total_V_ntetid_Sek=('WaitTime', 'sum'),
         Antal_Besvarade_Samtal=('is_answered', 'sum')
     ).reset_index()
 
-    if df_hourly_sparse.empty:
-        print("VARNING: Ingen data kvar efter aggregering. Kan inte träna modell.")
-        sys.exit(1)
-
-    print("-> Skapar komplett rutnät...")
-    start_time = pd.to_datetime(df_hourly_sparse['Created'].min()).tz_localize(None)
-    end_time = pd.to_datetime(df_hourly_sparse['Created'].max()).tz_localize(None)
+    # Grid
+    start_time = df_hourly_agg['Created'].min()
+    end_time = df_hourly_agg['Created'].max()
     all_hours = pd.date_range(start=start_time, end=end_time, freq='h')
+    unique_combos = df_hourly_agg[['TjänstTyp', 'Behavior_Segment']].drop_duplicates()
+    df_master = pd.merge(pd.DataFrame({'Created': all_hours}), unique_combos, how='cross')
     
-    hierarki_cols = ['Behavior_Segment']
-    existing_hierarchies = df_hourly_sparse[hierarki_cols].drop_duplicates()
-    print(f"-> Hittade {len(existing_hierarchies)} unika segment att bygga rutnät för.")
-
-    df_master_grid_base = pd.DataFrame({'Created': all_hours})
-    df_master_grid = df_master_grid_base.merge(existing_hierarchies, how='cross')
-
-    df_hourly_sparse['Created'] = pd.to_datetime(df_hourly_sparse['Created']).dt.tz_localize(None)
-    df_master_grid['Created'] = pd.to_datetime(df_master_grid['Created']).dt.tz_localize(None)
+    df_final = pd.merge(df_master, df_hourly_agg, on=['Created', 'TjänstTyp', 'Behavior_Segment'], how='left')
+    fill_cols = ['Antal_Samtal', 'Total_Samtalstid_Sek', 'Total_V_ntetid_Sek', 'Antal_Besvarade_Samtal']
+    df_final[fill_cols] = df_final[fill_cols].fillna(0).astype(int)
     
-    df_hourly = pd.merge(
-        df_master_grid, df_hourly_sparse,
-        on=['Created'] + hierarki_cols, how='left'
-    )
+    df_final.rename(columns={'Created': 'ds', 'TjänstTyp': 'Tj_nstTyp'}, inplace=True)
     
-
-    fill_zero_cols = ['Antal_Samtal', 'Total_Väntetid_Sek', 'Total_Samtalstid_Sek', 'Antal_Övergivna', 'Antal_Besvarade_Samtal']
-    for col in fill_zero_cols:
-        df_hourly[col] = df_hourly[col].fillna(0).astype(int)
-
-    df_hourly['Andel_Övergivna'] = (df_hourly['Antal_Övergivna'] / df_hourly['Antal_Samtal']).fillna(0)
-    df_hourly.rename(columns={'Created': 'ds'}, inplace=True)
-    print(f"-> Träningsdata har nu {len(df_hourly)} rader (inkl. noll-timmar).")
-
-    # ... (STEG 3: Skapa Features) ...
-    print("-> Skapar tids-features...")
-    df_model = add_all_features(df_hourly, ds_col='ds')
+    # Features & Lags
+    print(f"-> Skapar lags för {len(df_final)} rader...")
+    df_final = add_all_features(df_final, ds_col='ds')
+    df_final.columns = [re.sub(r'[^A-Za-z0-9_]+', '_', col) for col in df_final.columns]
+    df_final = create_lag_features(df_final, group_cols=['Tj_nstTyp', 'Behavior_Segment'], target_col='Antal_Samtal', lags=[1, 7, 14, 28, 364])
     
-    print("-> Rensar kolumnnamn för LightGBM...")
-    df_model.columns = [re.sub(r'[^A-Za-z0-9_]+', '_', col) for col in df_model.columns]
+    # Spara Historik
+    tn_hist = config.TABLE_NAMES['Hourly_Aggregated_History']
+    df_final.to_sql(f"{tn_hist}_STAGING", mssql_engine, if_exists='replace', index=False, chunksize=50000)
+    with mssql_engine.connect() as conn:
+        conn.execute(text(f"IF OBJECT_ID('{tn_hist}', 'U') IS NOT NULL DROP TABLE [{tn_hist}]; SELECT * INTO [{tn_hist}] FROM [{tn_hist}_STAGING];"))
+        conn.commit()
 
-    print("-> Skapar Lag Features (säsongsvariationer)...")
-    rensad_hierarki = ['Behavior_Segment']
-    rensad_hierarki = [col for col in rensad_hierarki if col in df_model.columns]
+    # --- 1. VOLYM (DAGLIG) ---
+    print("\n--- Tränar Volym (Daglig) ---")
+    df_vol_train = df_final.groupby([pd.Grouper(key='ds', freq='D'), 'Tj_nstTyp']).agg({'Antal_Samtal': 'sum'}).reset_index()
+    df_vol_train = add_all_features(df_vol_train, ds_col='ds')
+    df_vol_train = create_lag_features(df_vol_train, group_cols=['Tj_nstTyp'], target_col='Antal_Samtal', lags=[1, 7, 14, 28, 364])
+    df_vol_train = df_vol_train.dropna(subset=['Antal_Samtal_lag_1d'])
     
-    df_model = create_lag_features(
-        df=df_model,
-        group_cols=rensad_hierarki,
-        target_col='Antal_Samtal',
-        lags=[1, 7, 14, 28, 364]
-    )
+    raw_base_features = ['veckodag', 'dag_på_året', 'vecka_nr', 'månad', 'kvartal', 'är_arbetsdag']
+    vol_features = raw_base_features + [c for c in df_vol_train.columns if '_lag_' in c] + ['Tj_nstTyp']
     
-    print("Beräknar AHT/AWT...")
-    df_model['Snitt_Taltid_Sek'] = df_model.apply(
-        lambda row: row['Total_Samtalstid_Sek'] / row['Antal_Besvarade_Samtal'] if row['Antal_Besvarade_Samtal'] > 0 else 0,
-        axis=1
-    )
-    df_model['Snitt_V_ntetid_Sek'] = df_model.apply(
-        lambda row: row['Total_V_ntetid_Sek'] / row['Antal_Samtal'] if row['Antal_Samtal'] > 0 else 0,
-        axis=1
-    )
-    lag_cols = [col for col in df_model.columns if '_lag_' in col]
-    df_model[lag_cols] = df_model[lag_cols].fillna(0) 
+    # ***  Definiera och spara kategorier ***
+    cat_features = ['Tj_nstTyp', 'veckodag', 'månad']
+    category_dtypes = {} # Här sparar vi kartan
+    for c in cat_features:
+        df_vol_train[c] = df_vol_train[c].astype('category')
+        category_dtypes[c] = df_vol_train[c].dtype # Sparar dtypen
 
-    # ... (STEG 4: Förbered för modell) ...
-    print("-> Skapar feature-listor och sätter dtypes...")
-    base_features = [
-        'timme', 'veckodag', 'dag_p_ret', 'vecka_nr', 'm_nad', 'kvartal',
-        'r_arbetsdag', 'year_sin', 'year_cos'
-    ]
-    lag_features = [col for col in df_model.columns if '_lag_' in col]
-    print(f"-> Lägger till {len(lag_features)} lag-features i modellen.")
-
-    segment_features = ['Behavior_Segment']
-    rensad_segment_features = [re.sub(r'[^A-Za-z0-9_]+', '_', col) for col in segment_features]
-
-    features = base_features + lag_features + rensad_segment_features
-    features = [f for f in features if f in df_model.columns]
-    
-    final_categorical_raw = [
-        'timme', 'veckodag', 'm_nad', 'kvartal', 'Behavior_Segment'
-    ]
-    rensad_final_categorical = [re.sub(r'[^A-Za-z0-9_]+', '_', col) for col in final_categorical_raw]
-    rensad_final_categorical = [f for f in rensad_final_categorical if f in df_model.columns]
-
-    targets = {
-        'aht': 'Snitt_Taltid_Sek',
-        'awt': 'Snitt_V_ntetid_Sek'
+    models_to_train = {
+        'low': {'obj': 'quantile', 'alpha': 0.10},
+        'median': {'obj': 'quantile', 'alpha': 0.50},
+        'high': {'obj': 'quantile', 'alpha': 0.90},
+        'operative': {'obj': 'tweedie', 'alpha': None}
     }
 
-    print(f"-> Konverterar {len(rensad_final_categorical)} kategoriska features till 'category' dtype...")
-    for col in rensad_final_categorical:
-        if col in df_model.columns:
-            df_model[col] = df_model[col].astype('category')
+    for name, params in models_to_train.items():
+        print(f"  -> Tränar Volume_{name}...")
+        kw = {'objective': params['obj'], 'n_estimators': 500, 'random_state': 42}
+        if params['alpha']: kw['alpha'] = params['alpha']
+        
+        model = lgb.LGBMRegressor(**kw)
+        model.fit(df_vol_train[vol_features], df_vol_train['Antal_Samtal'], categorical_feature=cat_features)
+        
+        # SPARA MED KATEGORI-KARTA
+        path = os.path.join(config.MODEL_DIR, f'final_model_volume_{name}.pkl')
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'model': model, 
+                'features': vol_features, 
+                'categorical_features': cat_features,
+                'cat_dtypes': category_dtypes 
+            }, f)
 
-    # === STEG 5: Spara Aggregerad Fil - MED COMMIT ===
+    # --- 2. AHT (SEGMENT) ---
+    print("\n--- Tränar AHT (Segment) ---")
+    df_aht_train = df_final.groupby([pd.Grouper(key='ds', freq='D'), 'Behavior_Segment']).agg({
+        'Antal_Samtal': 'sum', 'Total_Samtalstid_Sek': 'sum', 'Total_V_ntetid_Sek': 'sum', 'Antal_Besvarade_Samtal': 'sum'
+    }).reset_index()
     
-    table_name_agg = config.TABLE_NAMES['Hourly_Aggregated_History']
-    staging_table_agg = f"{table_name_agg}_STAGING"
+    df_aht_train['Snitt_Taltid'] = np.where(df_aht_train['Antal_Besvarade_Samtal'] > 0, 
+                                            df_aht_train['Total_Samtalstid_Sek'] / df_aht_train['Antal_Besvarade_Samtal'], 0)
+    df_aht_train['Snitt_Vantetid'] = np.where(df_aht_train['Antal_Samtal'] > 0, 
+                                              df_aht_train['Total_V_ntetid_Sek'] / df_aht_train['Antal_Samtal'], 0)
     
-    try:
-        df_model_to_save = df_model.dropna(subset=['ds'])
-        print(f"-> Sparar {len(df_model_to_save)} rader till STAGING '{staging_table_agg}'...")
-        
-        df_model_to_save.head(10).to_sql(
-            staging_table_agg, mssql_engine, if_exists='replace', index=False
-        )
-        if len(df_model_to_save) > 10:
-            df_model_to_save.iloc[10:].to_sql(
-                staging_table_agg, mssql_engine, if_exists='append', index=False, chunksize=10000
-            )
-            
-        print(f"-> Flyttar data till PROD '{table_name_agg}' (Auto-Create)...")
-        
-        sql_transaction_agg = f"""
-        IF OBJECT_ID('{table_name_agg}', 'U') IS NOT NULL DROP TABLE [{table_name_agg}];
-        SELECT * INTO [{table_name_agg}] FROM [{staging_table_agg}];
-        """
-        with mssql_engine.connect() as connection:
-            connection.execute(text(sql_transaction_agg))
-            connection.commit() 
-
-        print(f"-> Historisk arbetsfil sparad till '{table_name_agg}'")
-        
-    except Exception as e:
-        print(f"FEL: Kunde inte spara aggregerad data till '{table_name_agg}'.")
-        print(f"Tekniskt fel: {e}")
-        sys.exit(1)
-
-    # ... (STEG 6: Träning med Early Stopping) ...
+    df_aht_train = add_all_features(df_aht_train, ds_col='ds')
+    aht_features = raw_base_features + ['Behavior_Segment']
+    cat_aht = ['Behavior_Segment', 'veckodag', 'månad']
     
-    print("\n-> Förbereder för träning med Early Stopping...")
-    VALIDATION_SPLIT_DAYS = 28
-    df_model['ds'] = pd.to_datetime(df_model['ds'])
-    max_date = df_model['ds'].max()
-    val_start_date = max_date - pd.Timedelta(days=VALIDATION_SPLIT_DAYS)
+    aht_dtypes = {}
+    for c in cat_aht:
+        df_aht_train[c] = df_aht_train[c].astype('category')
+        aht_dtypes[c] = df_aht_train[c].dtype # Spara karta
 
-    train_df_full = df_model[df_model['ds'] < val_start_date].copy()
-    val_df_full = df_model[df_model['ds'] >= val_start_date].copy()
+    df_aht_clean = df_aht_train[df_aht_train['Antal_Samtal'] > 0].copy()
 
-    if train_df_full.empty or val_df_full.empty:
-        print("FATALT: Inte tillräckligt med data för att skapa train/val-split. Använder all data.")
-        train_df_full = df_model.copy()
-        val_df_full = None 
-        
-    print(f"-> Träningsdata: {len(train_df_full)} rader")
-    print(f"-> Valideringsdata: {len(val_df_full) if val_df_full is not None else 0} rader")
-    
-    early_stopping_callbacks = [lgb.early_stopping(100, verbose=True)]
-    fit_params = { "callbacks": early_stopping_callbacks }
+    # AHT Model
+    print("  -> Tränar AHT...")
+    model_aht = lgb.LGBMRegressor(objective='regression', n_estimators=500, random_state=42)
+    model_aht.fit(df_aht_clean[aht_features], df_aht_clean['Snitt_Taltid'], categorical_feature=cat_aht)
+    with open(os.path.join(config.MODEL_DIR, 'final_model_aht.pkl'), 'wb') as f:
+        pickle.dump({'model': model_aht, 'features': aht_features, 'categorical_features': cat_aht, 'cat_dtypes': aht_dtypes}, f)
 
-    # === STEG 6B: TRÄNA MODELLERNA ===
-    print(f"-> Tränar med {len(features)} features.")
-    os.makedirs(config.MODEL_DIR, exist_ok=True)
+    # AWT Model
+    print("  -> Tränar AWT...")
+    model_awt = lgb.LGBMRegressor(objective='regression', n_estimators=500, random_state=42)
+    model_awt.fit(df_aht_clean[aht_features], df_aht_clean['Snitt_Vantetid'], categorical_feature=cat_aht)
+    with open(os.path.join(config.MODEL_DIR, 'final_model_awt.pkl'), 'wb') as f:
+        pickle.dump({'model': model_awt, 'features': aht_features, 'categorical_features': cat_aht, 'cat_dtypes': aht_dtypes}, f)
 
-    QUANTILES_TO_TRAIN = { 'low': 0.10, 'median': 0.50, 'high': 0.90 }
-
-    print("\n--- Tränar VOLYM-modell (Quantile Regression) ---")
-    target_col_volume = 'Antal_Samtal'
-    
-    X_train_vol = train_df_full[features]
-    y_train_vol = train_df_full[target_col_volume]
-    
-    if val_df_full is not None:
-        X_val_vol = val_df_full[features]
-        y_val_vol = val_df_full[target_col_volume]
-        fit_params["eval_set"] = [(X_val_vol, y_val_vol)]
-        fit_params["eval_metric"] = "quantile" 
-    else:
-        fit_params.pop("eval_set", None)
-
-    for name, alpha in QUANTILES_TO_TRAIN.items():
-        print(f"  -> Tränar {name}-prognos (alpha={alpha})...")
-        model_vol = lgb.LGBMRegressor(
-            objective='quantile', alpha=alpha, n_estimators=1000, random_state=42, metric='quantile'
-        )
-        try:
-            model_vol.fit(X_train_vol, y_train_vol, categorical_feature=rensad_final_categorical, **fit_params)
-        except Exception as e:
-            print(f"FEL vid träning av {name}: {e}")
-            continue
-        
-        model_payload = { 'model': model_vol, 'features': features, 'categorical_features': rensad_final_categorical }
-        with open(os.path.join(config.MODEL_DIR, f'final_model_volume_{name}.pkl'), 'wb') as f:
-            pickle.dump(model_payload, f)
-        print(f"  -> Modell sparad.")
-
-    # --- MODELL 2 & 3: AHT & AWT ---
-    for model_name, target_col in targets.items():
-        print(f"\n--- Tränar {model_name.upper()}-modell ---")
-        final_features_for_model = [f for f in features if f in df_model.columns]
-        
-        if model_name == 'aht':
-            train_df = train_df_full[train_df_full['Antal_Besvarade_Samtal'] > 0].copy()
-            if val_df_full is not None: val_df = val_df_full[val_df_full['Antal_Besvarade_Samtal'] > 0].copy()
-        else:
-            train_df = train_df_full[train_df_full['Antal_Samtal'] > 0].copy()
-            if val_df_full is not None: val_df = val_df_full[val_df_full['Antal_Samtal'] > 0].copy()
-                
-        X_train = train_df[final_features_for_model]
-        y_train = train_df[target_col]
-
-        if X_train.empty: continue
-            
-        if val_df_full is not None and not val_df.empty:
-            X_val = val_df[final_features_for_model]
-            y_val = val_df[target_col]
-            fit_params["eval_set"] = [(X_val, y_val)]
-            fit_params["eval_metric"] = "l1"
-        else:
-            fit_params.pop("eval_set", None)
-        
-        model = lgb.LGBMRegressor(objective='regression_l1', n_estimators=1000, random_state=42)
-        model.fit(X_train, y_train, categorical_feature=rensad_final_categorical, **fit_params)
-        
-        model_payload = { 'model': model, 'features': final_features_for_model, 'categorical_features': rensad_final_categorical }
-        with open(os.path.join(config.MODEL_DIR, f'final_model_{model_name}.pkl'), 'wb') as f:
-            pickle.dump(model_payload, f)
-        print(f"-> Modell sparad.")
-            
-    print("\nKLART! Den robusta, SEGMENT-baserade modellen har tränats.")
+    print("\n-> ALLA MODELLER TRÄNADE & SPARADE (MED KATEGORI-FIX)!")
 
 if __name__ == '__main__':
     train_final_system()

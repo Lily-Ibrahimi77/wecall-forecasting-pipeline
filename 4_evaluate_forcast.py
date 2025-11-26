@@ -1,153 +1,130 @@
 """
 ================================================================
-JOBB 4: Utvärdera Prognos (Feedback-loop / MLOps)
+JOBB 4: Utvärdera Prognos (SNIPER EDITION)
 ================================================================
-*** UPPDATERAD (ROBUST VERSION) ***
-- Styrs av config.RUN_MODE och utvärderar per SEGMENT.
-- Hämtar data robust utan att krascha om tabeller saknas.
+ Hämtar inte bara på datum (YYYY-MM-DD) utan 
+  identifierar den EXAKTA tidsstämpeln för senaste körningen.
+- Ignorerar "Zombie-data" som kan ligga kvar från gamla körningar
+  samma dag.
 """
-
 import pandas as pd
 import numpy as np
 from sqlalchemy import create_engine, text
-from datetime import datetime
 import config
 import sys
-import traceback
-from DataDriven_utils import get_current_time
 
 def evaluate_holdout_period():
-    print("--- Startar Jobb 4: Utvärdering av HOLD-OUT-period ---")
-
-    if config.RUN_MODE != 'VALIDATION':
-        print(f"-> INFO: 'RUN_MODE' är satt till '{config.RUN_MODE}'.")
-        print("-> Utvärderings-skriptet körs endast när 'RUN_MODE' är 'VALIDATION'. Avslutar.")
-        return
+    print("--- Startar Jobb 4 (SNIPER MODE) ---")
+    if config.RUN_MODE != 'VALIDATION': return
     
-    print("*** VALIDATION MODE AKTIVT ***")
-    
-    try:
-        mssql_engine = create_engine(config.MSSQL_CONN_STR)
-        print("-> Ansluten till MSSQL Data Warehouse.")
-    except Exception as e:
-        print(f"FATALT FEL: Kunde inte ansluta till MSSQL: {e}")
-        sys.exit(1)
+    mssql_engine = create_engine(config.MSSQL_CONN_STR)
+    start_date_str = config.VALIDATION_SETTINGS['EVALUATION_START_DATE']
+    end_date_str = config.VALIDATION_SETTINGS['EVALUATION_END_DATE']
 
-    # === STEG 1: Hämta datum från config ===
-    try:
-        settings = config.VALIDATION_SETTINGS
-        FORECAST_RUN_DATE_SQL = settings['FORECAST_RUN_DATE_SQL']
-        START_DATE_SQL = settings['EVALUATION_START_DATE']
-        END_DATE_SQL = settings['EVALUATION_END_DATE']
-    except Exception as e:
-        print(f"FATALT FEL: Kunde inte läsa 'VALIDATION_SETTINGS' från config.py. Fel: {e}")
-        sys.exit(1)
-
-    print(f"-> Utvärderar prognos för perioden: {START_DATE_SQL} till {END_DATE_SQL}")
-    print(f"-> (Jämför med prognos körd: {FORECAST_RUN_DATE_SQL})")
-
-    # === STEG 2: Hämta VERKLIGT utfall (Facit) ===
-    actuals_table = config.TABLE_NAMES['Hourly_Aggregated_History']
-    try:
-        # KORRIGERING: Hämta per SEGMENT
-        sql_actuals = f"""
-            SELECT ds, Behavior_Segment, Antal_Samtal 
-            FROM [{actuals_table}]
-            WHERE CONVERT(date, ds) BETWEEN '{START_DATE_SQL}' AND '{END_DATE_SQL}'
-        """
-        df_actuals = pd.read_sql(sql_actuals, mssql_engine)
-        df_actuals['ds'] = pd.to_datetime(df_actuals['ds']).dt.tz_localize(None)
-
-        if df_actuals.empty:
-            print(f"VARNING: Inga VERKLIGA data hittades i '{actuals_table}' för perioden.")
-            print("   -> Har du kört hela pipelinen (Fil 2) korrekt så att tabellen skapades?")
-            return
-        print(f"-> Hämtade {len(df_actuals)} verkliga tim-värden.")
-    except Exception as e:
-        print(f"FEL: Kunde inte hämta verkliga data från '{actuals_table}'.")
-        print(f"Tekniskt fel: {e}")
-        return
-
-    # === STEG 3: Hämta PROGNOS ===
     archive_table = config.TABLE_NAMES['Forecast_Archive']
+    history_table = config.TABLE_NAMES['Hourly_Aggregated_History']
+    
+    # 1. Hitta SENASTE EXAKTA TIDSSTÄMPELN
+    print(f"-> Siktar in sig på senaste körningen...")
     try:
-        prognos_kolumn = "Prognos_Antal_Samtal" # (Median-prognosen)
-        sql_forecast = f"""
-            SELECT 
-                ds, Behavior_Segment, 
-                {prognos_kolumn} AS Prognos_Att_Jamfora
-            FROM [{archive_table}]
-            WHERE 
-                CONVERT(date, ForecastRunDate) = '{FORECAST_RUN_DATE_SQL}' 
-                AND CONVERT(date, ds) BETWEEN '{START_DATE_SQL}' AND '{END_DATE_SQL}'
+        # Vi hämtar MAX av hela datetime-objektet, inte bara datumsträngen
+        sql_check = f"""
+            SELECT MAX(ForecastRunDate) as MaxTimestamp
+            FROM [{archive_table}] 
+            WHERE CONVERT(date, DatumTid) BETWEEN '{start_date_str}' AND '{end_date_str}'
         """
-        df_forecast = pd.read_sql(sql_forecast, mssql_engine)
-        df_forecast['ds'] = pd.to_datetime(df_forecast['ds']).dt.tz_localize(None)
-
-        if df_forecast.empty:
-            print("VARNING: Inga PROGNOS-data hittades för perioden. Kan inte utvärdera.")
-            print(f"   -> Kontrollera att det finns en prognos i '{archive_table}' med ForecastRunDate = '{FORECAST_RUN_DATE_SQL}'.")
+        df_run = pd.read_sql(sql_check, mssql_engine)
+        
+        if df_run.empty or df_run.iloc[0]['MaxTimestamp'] is None:
+            print("VARNING: Inga prognoser hittades i arkivet.")
             return
             
-        print(f"-> Hämtade {len(df_forecast)} prognos-värden.")
+        # Detta är den exakta tidsstämpeln (t.ex. 2025-09-23 14:05:01.123)
+        latest_timestamp = df_run.iloc[0]['MaxTimestamp']
+        
+        # Konvertera till sträng som SQL förstår exakt
+        latest_ts_str = str(latest_timestamp)
+        # Hack för att hantera pandas/sql format ibland (ta bort .000 om det behövs, men oftast ok)
+        if '.' in latest_ts_str and len(latest_ts_str.split('.')[-1]) < 3:
+             latest_ts_str = latest_ts_str.split('.')[0] # Fallback om formatet bråkar
+
+        print(f"   -> Låst på exakt tid: {latest_ts_str}")
+        
     except Exception as e:
-        print(f"FEL: Kunde inte hämta prognosdata från '{archive_table}': {e}")
+        print(f"FEL vid sökning av prognos: {e}")
         return
 
-    # === STEG 4: Jämför och beräkna fel ===
-    print("-> Jämför verkligt utfall med prognos...")
+    # 2. Hämta Prognos (Filtrera på EXAKT tidsstämpel)
+    print(f"-> Hämtar prognosdata (rensar bort zombies)...")
     
-    df_merged = pd.merge(
-        df_actuals,
-        df_forecast,
-        on=['ds', 'Behavior_Segment'],
-        how='outer' 
-    )
+    # Använd parametriserad fråga eller mycket specifik sträng för att träffa rätt
+    sql_fc = f"""
+        SELECT DatumTid, TjänstTyp, Prognos_Antal_Samtal 
+        FROM [{archive_table}]
+        WHERE ForecastRunDate = '{latest_ts_str}'
+        AND CONVERT(date, DatumTid) BETWEEN '{start_date_str}' AND '{end_date_str}'
+    """
     
-    df_merged['Antal_Samtal'] = df_merged['Antal_Samtal'].fillna(0)
-    df_merged['Prognos_Att_Jamfora'] = df_merged['Prognos_Att_Jamfora'].fillna(0)
+    df_fc = pd.read_sql(sql_fc, mssql_engine)
     
-    df_merged['Error'] = df_merged['Antal_Samtal'] - df_merged['Prognos_Att_Jamfora']
-    df_merged['Abs_Error'] = df_merged['Error'].abs()
-    df_merged['Abs_Pct_Error'] = (df_merged['Abs_Error'] / df_merged['Antal_Samtal']).replace(np.inf, 0)
+    if df_fc.empty:
+        print("   VARNING: Inga rader matchade exakta tidsstämpeln. Försöker med datum-sträng (Fallback)...")
+        # Fallback om millisekunderna strular
+        run_date_only = str(latest_timestamp).split(' ')[0]
+        sql_fc = f"""
+            SELECT DatumTid, TjänstTyp, Prognos_Antal_Samtal 
+            FROM [{archive_table}]
+            WHERE CONVERT(VARCHAR, ForecastRunDate, 23) = '{run_date_only}'
+            AND CONVERT(date, DatumTid) BETWEEN '{start_date_str}' AND '{end_date_str}'
+        """
+        df_fc = pd.read_sql(sql_fc, mssql_engine)
+
+    print(f"   -> Hittade {len(df_fc)} prognosrader.")
     
-    # === STEG 5: Beräkna totala KPI:er ===
-    total_actual = df_merged['Antal_Samtal'].sum()
-    total_forecast = df_merged['Prognos_Att_Jamfora'].sum()
-    total_abs_error = df_merged['Abs_Error'].sum()
+    df_fc['Datum'] = pd.to_datetime(df_fc['DatumTid']).dt.normalize()
+    df_fc['Key'] = df_fc['TjänstTyp'].astype(str).str.strip().str.lower()
     
-    # Undvik division med noll
-    mape = 0
-    if len(df_merged[df_merged['Antal_Samtal'] > 0]) > 0:
-        mape = df_merged[df_merged['Antal_Samtal'] > 0]['Abs_Pct_Error'].mean()
-        
-    rmse = np.sqrt(np.mean(df_merged['Error']**2))
+    # Aggregera prognos
+    df_fc_agg = df_fc.groupby(['Datum', 'Key'])['Prognos_Antal_Samtal'].sum().reset_index()
+
+    # 3. Hämta Facit
+    print(f"-> Hämtar facit från {history_table}...")
+    sql_act = f"""
+        SELECT ds, Tj_nstTyp, Antal_Samtal 
+        FROM [{history_table}] 
+        WHERE CONVERT(date, ds) BETWEEN '{start_date_str}' AND '{end_date_str}'
+    """
+    df_act = pd.read_sql(sql_act, mssql_engine)
+    df_act['Datum'] = pd.to_datetime(df_act['ds']).dt.normalize()
+    df_act['Key'] = df_act['Tj_nstTyp'].astype(str).str.strip().str.lower()
     
-    print("-" * 30)
-    print(f"UTVÄRDERING (för {START_DATE_SQL} till {END_DATE_SQL}):")
-    print(f"  Verkligt antal samtal: {total_actual}")
-    print(f"  Prognos antal samtal: {total_forecast}")
-    print(f"  Totalt absolut fel:    {total_abs_error}")
-    print(f"  MAPE (på tim-nivå):    {mape:.2%}")
-    print(f"  RMSE (på tim-nivå):    {rmse:.2f}")
-    print("-" * 30)
+    df_act_agg = df_act.groupby(['Datum', 'Key'])['Antal_Samtal'].sum().reset_index()
+
+    # 4. Jämför
+    df_merged = pd.merge(df_act_agg, df_fc_agg, on=['Datum', 'Key'], how='inner', suffixes=('_act', '_fc'))
     
-    # === STEG 6: Spara loggen till MSSQL (SÄKRAD) ===
-    log_table_name = config.TABLE_NAMES['Forecast_Performance']
-    try:
-        df_log = pd.DataFrame({
-            'LogRunDate': [get_current_time()],
-            'ForecastDate': [f"{START_DATE_SQL}_till_{END_DATE_SQL}"],
-            'MAPE': [mape], 'RMSE': [rmse], 'TotalActual': [total_actual],
-            'TotalForecast': [total_forecast], 'TotalAbsError': [total_abs_error]
-        })
-        
-        # Pandas 'append' sköter oftast transaktionen själv, men vi säkrar upp.
-        df_log.to_sql(log_table_name, mssql_engine, if_exists='append', index=False)
-        print(f"-> Prestanda-logg sparad till '{log_table_name}'.")
-        
-    except Exception as e:
-        print(f"FEL: Kunde inte spara prestanda-logg: {e}")
+    total_act = df_merged['Antal_Samtal'].sum()
+    total_fc = df_merged['Prognos_Antal_Samtal'].sum()
+    
+    if total_act == 0:
+        print("Ingen matchning mellan prognos och verklighet (kontrollera tjänstenamn).")
+        return
+
+    df_merged['AbsErr'] = (df_merged['Antal_Samtal'] - df_merged['Prognos_Antal_Samtal']).abs()
+    wmape = (df_merged['AbsErr'].sum() / total_act) * 100
+    accuracy = max(0, 100 - wmape)
+
+    print(f"\nRESULTAT ({start_date_str} - {end_date_str}):")
+    print("="*40)
+    print(f"Körning ID (Tid):   {latest_ts_str}")
+    print("-" * 20)
+    print(f"Verklig Volym:      {int(total_act)}")
+    print(f"Prognos Volym:      {int(total_fc)}")
+    print(f"Diff (Antal):       {int(total_fc - total_act)}")
+    print("-" * 20)
+    print(f"wMAPE (Felprocent): {wmape:.2f}%")
+    print(f"Träffsäkerhet:      {accuracy:.2f}%")
+    print("="*40)
 
 if __name__ == '__main__':
     evaluate_holdout_period()

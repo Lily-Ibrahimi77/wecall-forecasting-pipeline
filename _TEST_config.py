@@ -16,20 +16,26 @@ import urllib
 RUN_MODE = 'VALIDATION'
 PROJECT_TIMEZONE = 'Europe/Stockholm'
 
+FORECAST_HORIZON_DAYS = 7
+HOLDOUT_PERIOD_DAYS = 7
+
+#Tröskelvärde för återuppringning (i sekunder)
+REDIAL_THRESHOLD_SEC = 300 # (5 minuter)
+
 # Centrala inställningar för din "hold-out"-validering
 VALIDATION_SETTINGS = {
-    # 1_Extract... stannar på detta datum ("igår")
-    'TRAINING_END_DATE': '2025-09-30 23:59:59', 
+    # Vi låtsas att träningen slutar den 23:e
+    'TRAINING_END_DATE': '2025-09-23 18:30:00', 
     
-    # 3_Run... börjar prognostisera från detta datum
-    'FORECAST_START_DATE': '2025-10-01 00:00:00',
+    # Prognosen startar då den 24:e (vilket vi har facit för!)
+    'FORECAST_START_DATE': '2025-09-24 00:00:00',
     
-    # 4_evaluate... använder dessa datum för att jämföra prognos mot facit
-    'EVALUATION_START_DATE': '2025-10-01',
-    'EVALUATION_END_DATE': '2025-10-09',
+    # Vi utvärderar den veckan vi har data för
+    'EVALUATION_START_DATE': '2025-09-24',
+    'EVALUATION_END_DATE': '2025-09-30',
     
-    # 4_evaluate... letar efter prognosen som "kördes" detta datum
-    'FORECAST_RUN_DATE_SQL': '2025-09-30'
+    # Detta är datumet Evaluate-skriptet kommer leta efter
+    'FORECAST_RUN_DATE_SQL': '2025-09-23'
 }
 
 # --- 1. Databasanslutningar (KÄLLOR) ---
@@ -117,26 +123,24 @@ MSSQL_CONN_STR = get_mssql_conn_string(MSSQL_DB)
 
 
 # --- 4. Affärsregler & Filtrering ---
-OPERATIONAL_MONTHS_AGO = 2
-STRATEGIC_MONTHS_AGO = 2
-BUSINESS_HOURS_START = "06:30:00"
-BUSINESS_HOURS_END = "18:00:00"
+OPERATIONAL_MONTHS_AGO = 3
+STRATEGIC_MONTHS_AGO = 3
 CALL_CHANNEL_NAME = 'call'
 
 SICK_LEAVE_NUMBER = '+46607890220'
 
 # FIXAD: Tog bort dubbletten '150'
-EXCLUDE_QUEUE_IDS = [ 148, 150, 151, 156, 157, 168, 166, 171, 172, 173, 174, 175, 176]
+EXCLUDE_QUEUE_IDS = [ 148, 150, 151, 156, 157, 168, 166, 176]
 EXCLUDE_CUSTOMER_IDS = [
     74727,
-    123113,
-    125303,
-    170378,
+    #123113 Ax kund,
+    #125303 Ax kund,
+    170378 ,
     132810, 
     20613,
-    119050,
-    121345,
-    119278,
+    #119050 Axeon teleservice ab,
+    # 121345 AxFast,
+    #119278 Ax felanmälan,
     154358,
     154787,
     154832,
@@ -167,13 +171,16 @@ QUEUE_TO_SERVICETYPE_MAP = {
     147: "Kundtjänst Omni", # Samtal/Mail/Chatt
     154: "Kö 11",
     163: "Ingen Väntetid",
-    # Specifika Kunder
     145: "Kund: Advokat",
     152: "Kund: Prezero IT",
     161: "Kund: Polygon",
+    171:"Bolag: Ax Advokater",
+    172:"Bolag: Axeon",
+    173:"Bolag: Axeon Park",
+    174:"Bolag: Ax Prio",
+    175:"Bolag: Ax Övrigt",
     177: "Kund: Flexmassage",
-    178: "Kund: Kävlinge", 
-    # Lägg till fler specifika kund-IDn här
+    178: "Kund: Kävlinge",
 }
 
 # --- 5. Ekonomiska Schablonvärden ---

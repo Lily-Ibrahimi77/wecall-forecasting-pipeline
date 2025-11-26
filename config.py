@@ -18,6 +18,12 @@ import urllib
 # Sätt denna till 'VALIDATION' för att köra din "hold-out"-test (oktober)
 RUN_MODE = 'PRODUCTION' # <-- ÄNDRA DENNA ENDA RAD
 
+FORECAST_HORIZON_DAYS = 14
+HOLDOUT_PERIOD_DAYS = 7
+
+#Tröskelvärde för återuppringning (i sekunder)
+REDIAL_THRESHOLD_SEC = 300 # (5 minuter)
+
 # Alla 'datetime.now()'-anrop och tidsomvandlingar ska använda detta.
 PROJECT_TIMEZONE = 'Europe/Stockholm'
 
@@ -52,7 +58,7 @@ BILLING_TABLES = {
     "customers": "customers"
 }
 
-# Döpte om denna från CASEMANAGE_TABLES för tydlighet
+# Döpte om denna från CASEMANAGE_TABLES
 CASE_TABLES = {
     "users": "users",
     "cases": "cases" 
@@ -108,25 +114,22 @@ MSSQL_CONN_STR = get_mssql_conn_string(MSSQL_DB)
 # --- 4. Affärsregler & Filtrering ---
 OPERATIONAL_MONTHS_AGO = 16
 STRATEGIC_MONTHS_AGO = 16
-BUSINESS_HOURS_START = "06:30:00"
-BUSINESS_HOURS_END = "18:00:00"
 CALL_CHANNEL_NAME = 'call'
-
 SICK_LEAVE_NUMBER = '+46607890220'
-# axeon, wecall, test etc
-EXCLUDE_QUEUE_IDS = [ 148, 150, 151, 156, 157, 168, 166, 171, 172, 173, 174, 175, 176]
+# wecall, test etc
+EXCLUDE_QUEUE_IDS = [ 148, 150, 151, 156, 157, 168, 166, 176]
 
-# wecal, axeon, interna linjer, lrf, eltel, upplevelse
+# wecal, interna linjer, lrf, eltel, upplevelse
 EXCLUDE_CUSTOMER_IDS = [
     74727,
-    123113,
-    125303,
-    170378,
+    #123113 Ax kund,
+    #125303 Ax kund,
+    170378 ,
     132810, 
     20613,
-    119050,
-    121345,
-    119278,
+    #119050 Axeon teleservice ab,
+    # 121345 AxFast,
+    #119278 Ax felanmälan,
     154358,
     154787,
     154832,
@@ -161,9 +164,13 @@ QUEUE_TO_SERVICETYPE_MAP = {
     145: "Kund: Advokat",
     152: "Kund: Prezero IT",
     161: "Kund: Polygon",
+    171:"Bolag: Ax Advokater",
+    172:"Bolag: Axeon",
+    173:"Bolag: Axeon Park",
+    174:"Bolag: Ax Prio",
+    175:"Bolag: Ax Övrigt",
     177: "Kund: Flexmassage",
     178: "Kund: Kävlinge", 
-    # Lägg till fler specifika kund-IDn här
 }
 
 # --- 5. Ekonomiska Schablonvärden ---

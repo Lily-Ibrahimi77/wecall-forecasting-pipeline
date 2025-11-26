@@ -1,11 +1,12 @@
+import logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 """
 ================================================================
-JOBB 1.5: Kör Kundsegmentering (Business Logic / Quantiles)
+JOBB 1.5: Kundsegmentering (Business Logic) -
 ================================================================
-*** UPPDATERAD (LOGISK SEGMENTERING) ***
-- Ersätter K-Means med Kvantiler (Percentiler).
-- Garanterar att segmenten är logiska (Hög Volym ÄR faktiskt Hög Volym).
-- Behåller all annan logik (Sjukanmälan, Peaks, Commit).
+- 'Segment_Sjukanmälan' (Kollar Key, Namn och Tjänst).
+- Säkrar 'mode()' med safe_mode för att undvika krasch på tom data.
 """
 
 import pandas as pd
@@ -16,6 +17,13 @@ import sys
 import traceback
 from DataDriven_utils import add_all_features
 
+# --- HJÄLPFUNKTION: Safe Mode ---
+def safe_mode(x):
+    """Hanterar om mode() returnerar tomt (t.ex. vid unik data eller tom serie)"""
+    m = x.mode()
+    if m.empty: return 'Okänd Typ'
+    return m.iloc[0]
+
 def create_and_save_segments():
     print("--- Startar Jobb 1.5: Kundsegmentering (Business Logic) ---")
 
@@ -24,15 +32,15 @@ def create_and_save_segments():
         print("-> Ansluten till MSSQL Data Warehouse.")
     except Exception as e:
         print(f"FATALT FEL: Kunde inte ansluta till MSSQL: {e}")
-        sys.exit(1)
+        raise Exception('Processen avbröts pga fel')
 
     # === STEG 1: Läs in historik ===
     table_name_training = config.TABLE_NAMES['Operative_Training_Data']
     print(f"-> Läser in historik från '{table_name_training}'...")
 
     try:
-        cols_to_use = ['Created', 'Name', 'QueueId', 'CustomerKey', 'TalkTimeInSec', 'CallId']
-        cols_str = ", ".join([f'[{col}]' for col in cols_to_use if col is not None])
+        cols_to_use = ['Created', 'Name', 'QueueId', 'CustomerKey', 'TalkTimeInSec', 'CallId', 'TjänstTyp'] 
+        cols_str = ", ".join([f'[{col}]' for col in cols_to_use])
         
         sql_query = f'SELECT {cols_str} FROM [{table_name_training}]'
         df_history = pd.read_sql(sql_query, mssql_engine)
@@ -40,14 +48,14 @@ def create_and_save_segments():
         
         if df_history.empty:
             print("VARNING: Ingen historisk data hittades.")
-            sys.exit(1)
+            return 
             
         print(f"-> Läste {len(df_history)} samtalshändelser.")
         
     except Exception as e:
         print(f"FEL: Kunde inte läsa data från '{table_name_training}'.")
         print(f"Tekniskt fel: {e}")
-        sys.exit(1)
+        raise Exception('Processen avbröts pga fel')
 
     # === STEG 2: Aggregera ===
     print("-> Aggregerar per (CustomerKey)...")
@@ -57,7 +65,9 @@ def create_and_save_segments():
     df_agg = df_history_features.groupby(['CustomerKey']).agg(
         Total_Samtal=('CallId', 'count'),
         Total_Samtalstid_Sek=('TalkTimeInSec', 'sum'),
-        Name=('Name', 'first')
+        Name=('Name', 'first'),
+        # Använder safe_mode här
+        TjänstTyp=('TjänstTyp', safe_mode) 
     ).reset_index()
     
     df_agg['Genomsnittlig_AHT_Sek'] = (df_agg['Total_Samtalstid_Sek'] / df_agg['Total_Samtal']).fillna(0).astype(int)
@@ -75,41 +85,47 @@ def create_and_save_segments():
     df_segments = pd.merge(df_agg, df_peak[['CustomerKey', 'Peak_Pattern']], on=['CustomerKey'], how='left')
     df_segments['Peak_Pattern'] = df_segments['Peak_Pattern'].fillna('Oklart')
 
-    # === STEG 4: SEGMENTERING (NY LOGIK: KVANTILER) ===
+    # === STEG 4: SEGMENTERING ===
     print("-> Skapar segment (Logiska Kvantiler)...")
     
-    # Vi sätter gränserna baserat på verklig data
-    # Volym: De 20% största kunderna är "Hög Volym" (Pareto-ish)
     vol_limit = df_segments['Total_Samtal'].quantile(0.80)
-    
-    # AHT: Medianen delar vad som är "Långt" eller "Kort"
     aht_limit = df_segments['Genomsnittlig_AHT_Sek'].quantile(0.50)
 
     print(f"   -> Gräns Hög Volym (Top 20%): > {vol_limit:.0f} samtal")
     print(f"   -> Gräns Långa Ärenden (Median): > {aht_limit:.0f} sek")
 
     def get_segment(row):
-        # Specialfall: Sjukanmälan
-        if row['CustomerKey'] == 'INTERNAL_SICK':
+        
+        # kollar både ID, Namn och TjänstTyp för att vara säkra (Case Insensitive)
+        c_key = str(row['CustomerKey']).upper().strip()
+        c_name = str(row['Name']).lower()
+        c_service = str(row['TjänstTyp']).lower()
+        
+        # Logic: Om någon av dessa stämmer är det Sjukanmälan
+        is_sick = (c_key == 'INTERNAL_SICK') or \
+                  ('sjukanmälan' in c_name) or \
+                  ('personal' in c_service) or \
+                  ('sjuk' in c_service)
+
+        if is_sick:
             return 'Segment_Sjukanmälan'
         
-        # Logisk indelning
+        # Vanlig logik
         vol_label = 'Hög-Volym' if row['Total_Samtal'] > vol_limit else 'Låg-Volym'
         aht_label = 'Långa-Ärenden' if row['Genomsnittlig_AHT_Sek'] > aht_limit else 'Korta-Ärenden'
         
         return f"{vol_label}_{aht_label}"
 
-    # Applicera logiken på varje rad
     df_segments['Behavior_Segment'] = df_segments.apply(get_segment, axis=1)
     
-    # Visa fördelning
     print("   -> Segmentfördelning:")
     print(df_segments['Behavior_Segment'].value_counts())
 
     # === STEG 5: Spara Dim_Customer_Behavior ===
     output_table_name = config.TABLE_NAMES['Customer_Behavior_Dimension']
     staging_table_name = f"{output_table_name}_STAGING"
-    final_cols = ['CustomerKey', 'Name', 'Total_Samtal', 'Genomsnittlig_AHT_Sek', 'Behavior_Segment']
+    
+    final_cols = ['CustomerKey', 'Name', 'TjänstTyp', 'Total_Samtal', 'Genomsnittlig_AHT_Sek', 'Behavior_Segment']
     df_to_save = df_segments[final_cols]
 
     try:
@@ -117,20 +133,28 @@ def create_and_save_segments():
         df_to_save.to_sql(staging_table_name, mssql_engine, if_exists='replace', index=False, chunksize=1000)
 
         print(f"-> Flyttar till PROD '{output_table_name}'...")
-        sql_transaction = f"""
-        IF OBJECT_ID('{output_table_name}', 'U') IS NOT NULL DROP TABLE [{output_table_name}];
-        SELECT * INTO [{output_table_name}] FROM [{staging_table_name}];
-        """
+        # Använder Transaction & Rollback (Säkerhet)
         with mssql_engine.connect() as connection:
-            connection.execute(text(sql_transaction))
+            connection.execute(text(f"""
+                BEGIN TRY
+                    BEGIN TRANSACTION;
+                    IF OBJECT_ID('{output_table_name}', 'U') IS NOT NULL DROP TABLE [{output_table_name}];
+                    SELECT * INTO [{output_table_name}] FROM [{staging_table_name}];
+                    COMMIT TRANSACTION;
+                END TRY
+                BEGIN CATCH
+                    ROLLBACK TRANSACTION;
+                    THROW;
+                END CATCH;
+            """))
             connection.commit() 
         print(f"-> KLART: '{output_table_name}' uppdaterad.")
 
     except Exception as e:
         print(f"FATALT FEL vid sparning av segment: {e}")
-        sys.exit(1)
+        raise Exception('Processen avbröts pga fel')
 
-    # === STEG 6: Peak Analysis (Oförändrad, men bra att ha med) ===
+    # === STEG 6: Peak Analysis ===
     print("-> Analyserar månatliga topp-tider...")
     try:
         df_samtal = df_history_features[df_history_features['TalkTimeInSec'] > 0].copy()
@@ -170,16 +194,21 @@ def create_and_save_segments():
             peak_table_name = config.TABLE_NAMES.get('Monthly_Peak_Analysis', 'Dim_Customer_Monthly_Peaks')
             peak_staging_table_name = f"{peak_table_name}_STAGING"
 
-            print(f"-> Sparar peaks till STAGING...")
             df_top_peaks.to_sql(peak_staging_table_name, mssql_engine, if_exists='replace', index=False, chunksize=1000)
             
-            print(f"-> Flyttar till PROD '{peak_table_name}'...")
-            peak_sql_transaction = f"""
-            IF OBJECT_ID('{peak_table_name}', 'U') IS NOT NULL DROP TABLE [{peak_table_name}];
-            SELECT * INTO [{peak_table_name}] FROM [{peak_staging_table_name}];
-            """
             with mssql_engine.connect() as connection:
-                connection.execute(text(peak_sql_transaction))
+                connection.execute(text(f"""
+                    BEGIN TRY
+                        BEGIN TRANSACTION;
+                        IF OBJECT_ID('{peak_table_name}', 'U') IS NOT NULL DROP TABLE [{peak_table_name}];
+                        SELECT * INTO [{peak_table_name}] FROM [{peak_staging_table_name}];
+                        COMMIT TRANSACTION;
+                    END TRY
+                    BEGIN CATCH
+                        ROLLBACK TRANSACTION;
+                        THROW;
+                    END CATCH;
+                """))
                 connection.commit()
             
             print(f"-> KLART: '{peak_table_name}' sparad.")

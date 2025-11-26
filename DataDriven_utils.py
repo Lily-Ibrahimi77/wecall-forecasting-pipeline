@@ -2,8 +2,8 @@
 ================================================================
 VERKTYGSLÅDA (DataDriven_utils.py)
 ================================================================
-*** KORRIGERAD VERSION (av Data Scientist) ***
-- NY FUNKTION: get_current_time() för centraliserad tid.
+***
+- get_current_time() för centraliserad tid.
 - add_all_features: Tvingar 'naive' datetimes (tar bort tidszon).
 - get_customer_data: Använder den robusta logiken från 1_Extract.
 """
@@ -20,9 +20,10 @@ import pytz
 import pandas as pd
 import numpy as np
 
+
 def create_lag_features(df, group_cols, target_col, lags):
     """ 
-    Skapar lag-features grupperat (t.ex. per segment).
+    Skapar lag-features grupperat (t.ex. per segment eller CustomerKey).
     Kräver att 'ds' (datetime) finns i df.
     """
     df_out = df.copy()
@@ -43,13 +44,14 @@ def create_lag_features(df, group_cols, target_col, lags):
         col_name = f'{target_col}_lag_{lag_days}d'
         print(f"  -> Skapar {col_name} (shift {lag_hours}h)...")
         try:
-            # Använd shift() inom groupby för att förhindra dataläckage mellan segment
+            # Använd shift() inom groupby för att förhindra dataläckage mellan grupper
             df_out[col_name] = g[target_col].shift(lag_hours)
         except Exception as e:
             print(f"    VARNING: Kunde inte skapa lag feature {col_name}: {e}")
             df_out[col_name] = np.nan
             
     return df_out
+
 
 
 def get_current_time() -> datetime:
@@ -107,9 +109,6 @@ def get_customer_data(engine=None) -> pd.DataFrame:
         """
         
         df_customer_mapping_raw = pd.read_sql(customer_query, engine)
-        
-        # ... (Resten av funktionen med list-split och städning är IDENTISK med förut) ...
-        # (Förkortar här för att spara plats, kopiera logiken från din gamla fil)
         
         df_customer_mapping_raw['LandingNumber_list'] = df_customer_mapping_raw['LandingNumber'].astype(str).str.split(',')
         df_customer_mapping_exploded = df_customer_mapping_raw.explode('LandingNumber_list')
@@ -194,14 +193,14 @@ def add_all_features(df: pd.DataFrame, ds_col: str = 'ds') -> pd.DataFrame:
     df['år'] = df[ds_col].dt.year
     df['datum'] = df[ds_col].dt.date
 
-    # === KORRIGERING: Lade till namn-mappningar ===
+    
     dag_map = {0: 'Mån', 1: 'Tis', 2: 'Ons', 3: 'Tor', 4: 'Fre', 5: 'Lör', 6: 'Sön'}
     month_map = {1: 'Jan', 2: 'Feb', 3: 'Mar', 4: 'Apr', 5: 'Maj', 6: 'Jun', 
                  7: 'Jul', 8: 'Aug', 9: 'Sep', 10: 'Okt', 11: 'Nov', 12: 'Dec'}
 
     df['veckodag_namn'] = df['veckodag'].map(dag_map)
     df['månad_namn'] = df['månad'].map(month_map)
-    # === SLUT PÅ KORRIGERING ===
+    
 
     # Hämta helgdagar
     unique_years = df[ds_col].dt.year.unique().tolist()

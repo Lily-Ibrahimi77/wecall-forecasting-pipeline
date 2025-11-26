@@ -1,8 +1,8 @@
 @ECHO OFF
-TITLE Operativ Prognos-pipeline (ROBUST VERSION)
+TITLE Operativ Prognos-pipeline
 
 ECHO ==========================================================
-ECHO KORNING AV ROBUST OPERATIV PROGNOS-PIPELINE
+ECHO KORNING AV OPERATIV PROGNOS-PIPELINE
 ECHO (INKL. KUNDSEGMENTERING, TRANING, PROGNOS OCH UTVARDERING)
 ECHO ==========================================================
 ECHO.
@@ -61,9 +61,11 @@ IF %ERRORLEVEL% NEQ 0 (
     GOTO :ERROR
 )
 
+
+
 ECHO.
 ECHO ----------------------------------------------------------
-ECHO Steg 3: Kor 3_Run_Operative_Forecast.py (med arkivering)...
+ECHO Steg 3: Kor 3_Run_Operative_Forecast.py...
 ECHO (Skapar 14-dagars prognos per Kund/Segment)
 ECHO ----------------------------------------------------------
 python "3_Run_Operative_Forecast.py"
@@ -83,20 +85,10 @@ IF %ERRORLEVEL% NEQ 0 (
     GOTO :ERROR
 )
 
-ECHO.
-ECHO ----------------------------------------------------------
-ECHO Steg 5: Kor 4_Evaluate_Forecast.py (Feedback-loop)...
-ECHO (Utvarderar foregaende prognos jamfort med verklighet)
-ECHO ----------------------------------------------------------
-python "4_evaluate_forcast.py"
-IF %ERRORLEVEL% NEQ 0 (
-    ECHO FEL: 4_Evaluate_Forecast.py misslyckades!
-    GOTO :ERROR
-)
 
 ECHO.
 ECHO ==========================================================
-ECHO KLART! Hela den robusta, operativa pipelinen lyckades.
+ECHO KLART! Hela den operativa pipelinen lyckades.
 ECHO ==========================================================
 ECHO.
 PAUSE

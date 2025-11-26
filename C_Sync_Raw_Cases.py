@@ -2,9 +2,8 @@
 ================================================================
 JOBB 4: Synka Agent-data (C_Sync_Raw_Cases.py)
 ================================================================
-*** UPPDATERAD (SQL-OPTIMIZED + QUEUEID KVAR) ***
 - Utför flytten helt internt i MSSQL (Bronze -> Fact).
-- Inkluderar 'QueueId' i slutresultatet.
+- Inkluderar 'QueueId'.
 - Filtrerar BORT exkluderade köer (enligt config).
 """
 
@@ -18,7 +17,7 @@ import sys
 
 def get_last_date_from_source(engine):
     try:
-        # Vi baserar tiden på samtalsdata (Bronze CDR) för att hålla det synkat
+        #  baserar tiden på samtalsdata (Bronze CDR) för att hålla det synkat
         bronze_cdr = config.BRONZE_TABLES['cdr']
         query = f"SELECT MAX(Created) as last_date FROM [{bronze_cdr}]"
         df = pd.read_sql(query, engine)
@@ -57,7 +56,7 @@ def sync_raw_cases_for_pbi():
         
         print(f"-> Kör intern SQL-transformering ({bronze_cases} -> {target_table})...")
 
-        # 3. Den OPTIMERADE SQL-frågan (Körs helt i databasen)
+        # 3. Körs helt i databasen
         sql_transaction = f"""
         IF OBJECT_ID('{target_table}', 'U') IS NOT NULL DROP TABLE [{target_table}];
 
@@ -81,7 +80,7 @@ def sync_raw_cases_for_pbi():
         # 4. Utför (Execute & Commit)
         with mssql_engine.connect() as connection:
             connection.execute(text(sql_transaction))
-            connection.commit() # VIKTIGT!
+            connection.commit()
 
         print(f"-> KLART! Tabellen '{target_table}' är återskapad och fylld (inkl. QueueId).")
 

@@ -1,263 +1,241 @@
 """
 ================================================================
-JOBB 3: Skapa Operativ Prognos (3_Run_Operative_Forecast.py)
+JOBB 3: Skapa Operativ Prognos (BUSINESS HOURS FIX)
 ================================================================
-*** UPPDATERAD (SJUKANMÄLAN FIX) ***
-- Undantar 'Segment_Sjukanmälan' från öppettids-filtret.
-- Nu får du prognos även kl 05:00-06:00 för sjukanmälningar.
-- Innehåller även tidigare databas-fixar (Auto-Create + Commit).
+- Öppettider Mån-Fre 06:00 - 18:00.
+- All volym utanför dessa tider sätts till 0.
+- Dagsvolymen fördelas om så den enbart hamnar på öppettiderna.
 """
 
 import pandas as pd
 import numpy as np
 import pickle
 import os
-from datetime import datetime
-from DataDriven_utils import add_all_features, get_current_time, create_lag_features 
+from datetime import datetime, timedelta
+from DataDriven_utils import add_all_features
 import config
 from sqlalchemy import create_engine, text 
 import sys
-import traceback
 import re
 
-def load_model_and_features(model_path: str):
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"FATALT FEL: Modellfilen {model_path} hittades inte. Kör 2_Train_Operative_Model.py först.")
-    with open(model_path, 'rb') as f:
-        payload = pickle.load(f)
-    if not isinstance(payload, dict) or 'model' not in payload or 'features' not in payload or 'categorical_features' not in payload:
-        raise ValueError(f"Modellfilen {model_path} har fel format. Kör om 2_Train_Operative_Model.py.")
-    return payload['model'], payload['features'], payload['categorical_features']
+# --- FUNKTIONER ---
+def create_daily_lags(df, group_cols, target_col, lags):
+    df_out = df.copy()
+    df_out = df_out.sort_values(by=group_cols + ['ds'])
+    g = df_out.groupby(group_cols)
+    for lag_days in lags:
+        col_name = f'{target_col}_lag_{lag_days}d'
+        df_out[col_name] = g[target_col].shift(lag_days)
+    return df_out
+
+def load_model_payload(model_path: str):
+    if not os.path.exists(model_path): return None
+    with open(model_path, 'rb') as f: return pickle.load(f)
 
 def get_forecast_start_date(engine) -> datetime:
     if config.RUN_MODE == 'VALIDATION':
-        start_date_str = config.VALIDATION_SETTINGS.get('FORECAST_START_DATE', '2025-10-01 00:00:00')
-        start_date = pd.to_datetime(start_date_str).tz_localize(None)
-        print(f"*** VALIDATION MODE AKTIVT ***")
-        print(f"-> Prognosen startar från config: {start_date}", file=sys.stderr)
-        return start_date
+        if 'TRAINING_END_DATE' in config.VALIDATION_SETTINGS:
+            return pd.to_datetime(config.VALIDATION_SETTINGS['TRAINING_END_DATE']).normalize() + pd.Timedelta(days=1)
+    return (pd.Timestamp.now() + pd.Timedelta(days=1)).normalize()
 
+def calculate_hourly_shape(engine, services_list, target_col):
+    hist_table = config.TABLE_NAMES['Hourly_Aggregated_History']
     try:
-        hist_table_name = config.TABLE_NAMES['Hourly_Aggregated_History']
-        print(f"*** PRODUCTION MODE AKTIVT ***")
-        print(f"-> Söker efter sista träningsdatum från '{hist_table_name}'...", file=sys.stderr)
-        
-        query = f"SELECT MAX(ds) as last_training_date FROM [{hist_table_name}]" 
-        df_last_date = pd.read_sql(query, engine)
-        
-        if not df_last_date.empty and pd.notna(df_last_date.iloc[0]['last_training_date']):
-            last_date = pd.to_datetime(df_last_date.iloc[0]['last_training_date']).tz_localize(None)
-            start_date = last_date + pd.Timedelta(hours=1)
-            print(f"-> Sista träningsdata hittad: {last_date}. Prognosen startar: {start_date}", file=sys.stderr)
-            return start_date
-    except Exception as e:
-        print(f"-> VARNING: Kunde inte hitta sista datum ({e}). Använder fallback (get_current_time).", file=sys.stderr)
-    
-    start_date = (get_current_time() + pd.Timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    print(f"-> Fallback: Startar prognos från imorgon: {start_date}", file=sys.stderr)
-    return start_date
+        df = pd.read_sql(f"SELECT ds, Tj_nstTyp, Antal_Samtal FROM [{hist_table}] WHERE Antal_Samtal > 0", engine)
+    except:
+        return pd.DataFrame() 
 
+    df['ds'] = pd.to_datetime(df['ds']).dt.tz_localize(None)
+    df[target_col] = df['Tj_nstTyp'].astype(str).str.strip()
+    
+    df = df[df[target_col].isin(services_list)]
+    df = add_all_features(df, ds_col='ds')
+    df_daily = df.groupby(['datum', target_col])['Antal_Samtal'].sum().reset_index(name='Daily_Total')
+    df = pd.merge(df, df_daily, on=['datum', target_col])
+    df['Hourly_Proportion'] = df['Antal_Samtal'] / df['Daily_Total']
+    
+    df_shape = df.groupby(['veckodag', 'timme', target_col])['Hourly_Proportion'].mean().reset_index(name='Avg_Hourly_Proportion')
+    norm = df_shape.groupby(['veckodag', target_col])['Avg_Hourly_Proportion'].transform('sum')
+    df_shape['Avg_Hourly_Proportion'] = df_shape['Avg_Hourly_Proportion'] / norm
+    return df_shape[['veckodag', 'timme', target_col, 'Avg_Hourly_Proportion']]
+
+# --- HUVUDPROGRAM ---
 def create_final_forecast():
-    print(f"--- Skapar ROBUST 14-dagars kvantil-prognos (per SEGMENT) ---")
-
-    try:
-        mssql_engine = create_engine(config.MSSQL_CONN_STR)
-        print("-> Ansluten till MSSQL Data Warehouse.")
-    except Exception as e:
-        print(f"FATALT FEL: Kunde inte ansluta till MSSQL: {e}")
-        sys.exit(1)
-
-    models_loaded = False
-    try:
-        model_vol_low, _, _ = load_model_and_features(os.path.join(config.MODEL_DIR, 'final_model_volume_low.pkl'))
-        model_vol_median, features_volume, categorical_volume = load_model_and_features(os.path.join(config.MODEL_DIR, 'final_model_volume_median.pkl'))
-        model_vol_high, _, _ = load_model_and_features(os.path.join(config.MODEL_DIR, 'final_model_volume_high.pkl'))
-        model_aht, features_aht, categorical_aht = load_model_and_features(os.path.join(config.MODEL_DIR, 'final_model_aht.pkl'))
-        model_awt, features_awt, categorical_awt = load_model_and_features(os.path.join(config.MODEL_DIR, 'final_model_awt.pkl'))
-        models_loaded = True
-        
-    except (FileNotFoundError, ValueError) as e:
-        print(f"FATALT FEL: {e}. Kontrollera att 2_Train_Operative_Model.py har körts...")
-        sys.exit(1)
+    print("--- JOBB 3 STARTAR (BUSINESS HOURS) ---")
+    mssql_engine = create_engine(config.MSSQL_CONN_STR)
     
-    if models_loaded:
-        print("-> Alla 5 modeller (3 Volym, 1 AHT, 1 AWT) har laddats.")
-        
-        forecast_start_time = get_forecast_start_date(mssql_engine)
-
-        print(f"-> Skapar framtida tidsstämplar (14 dagar) från: {forecast_start_time}...")
-        future_dates = pd.date_range(start=forecast_start_time, periods=14 * 24, freq='h')
-        future_df_base = pd.DataFrame({'ds': future_dates})
-
-        print("-> Hämtar existerande (Segment) hierarkier från 'Dim_Customer_Behavior'...")
-        table_name_segments = config.TABLE_NAMES['Customer_Behavior_Dimension']
-        try:
-            hierarki_cols = ['Behavior_Segment']
-            cols_str = ", ".join([f'[{col}]' for col in hierarki_cols])
-            query = f"SELECT DISTINCT {cols_str} FROM [{table_name_segments}]"
-            
-            existing_hierarchies = pd.read_sql(query, mssql_engine)
-            if existing_hierarchies.empty:
-                print(f"FATALT FEL: Kan inte hämta hierarkier från '{table_name_segments}'.")
-                sys.exit(1)
-                
-            print(f"-> Hittade {len(existing_hierarchies)} unika segment att skapa prognos för.")
-        except Exception as e:
-            print(f"FATALT FEL: Kunde inte läsa från '{table_name_segments}': {e}")
-            sys.exit(1)
-            
-        future_df_skeleton = pd.merge(future_df_base, existing_hierarchies, how='cross')
-        print(f"-> Skapat {len(future_df_skeleton)} framtida rader (skelett) för prognos.")
-
-        
-        # === LAG-LOGIK ===
-        print("-> Hämtar historik för att bygga Lag-Features (lookback)...")
-        max_lag_days = 370
-        lookback_start_date = forecast_start_time - pd.Timedelta(days=max_lag_days)
-
-        hist_table_name = config.TABLE_NAMES['Hourly_Aggregated_History']
-        cols_to_load = ['ds', 'Behavior_Segment', 'Antal_Samtal']
-        cols_str = ", ".join([f'[{col}]' for col in cols_to_load])
-        query_hist = f"""
-            SELECT {cols_str} FROM [{hist_table_name}]
-            WHERE ds >= '{lookback_start_date.strftime('%Y-%m-%d %H:%M:%S')}' AND ds < '{forecast_start_time.strftime('%Y-%m-%d %H:%M:%S')}'
-        """
-        
-        try:
-            df_history = pd.read_sql(query_hist, mssql_engine)
-            df_history['ds'] = pd.to_datetime(df_history['ds'])
-            print(f"-> Hämtade {len(df_history)} historiska rader för lookback.")
-        except Exception as e:
-            print(f"FEL: Kunde inte hämta historik från '{hist_table_name}': {e}")
-            sys.exit(1)
-
-        print(f"-> Kombinerar {len(df_history)} (hist) och {len(future_df_skeleton)} (framtid)...")
-        df_combined = pd.concat([df_history, future_df_skeleton], ignore_index=True)
-        df_combined['Behavior_Segment'] = df_combined['Behavior_Segment'].astype(str)
-        df_combined = df_combined.sort_values(by=['Behavior_Segment', 'ds'])
-        df_combined = df_combined.drop_duplicates(subset=['Behavior_Segment', 'ds'], keep='last')
-
-        print("-> Skapar Tids-features och Lags...")
-        df_combined_features = add_all_features(df_combined, ds_col='ds')
-
-        df_with_lags = create_lag_features(
-            df=df_combined_features,
-            group_cols=['Behavior_Segment'],
-            target_col='Antal_Samtal',
-            lags=[1, 7, 14, 28, 364]
-        )
-
-        print("-> Filtrerar ut prognos-perioden...")
-        future_df_final = df_with_lags[df_with_lags['ds'] >= forecast_start_time].copy()
-        future_df_encoded = future_df_final 
-        
-        # === MODELLERING ===
-        future_df_encoded.columns = [re.sub(r'[^A-Za-z0-9_]+', '_', col) for col in future_df_encoded.columns]
-        
-        print("-> Säkerhetskontroll: Validerar att features finns...")
-        current_cols_vol = set(future_df_encoded.columns)
-        model_cols_vol = set(features_volume)
-        missing_features_vol = model_cols_vol - current_cols_vol
-        
-        if missing_features_vol:
-            print(f"!!! VARNING (VOLYM) !!! Följande features saknades och fylldes med 0: {missing_features_vol}")
-        
-        X_volume = future_df_encoded.reindex(columns=features_volume, fill_value=0)
-        X_aht = future_df_encoded.reindex(columns=features_aht, fill_value=0)
-        X_awt = future_df_encoded.reindex(columns=features_awt, fill_value=0)
-
-        print("-> Konverterar datatyper...")
-        for col in [c for c in categorical_volume if c in X_volume.columns]: X_volume[col] = X_volume[col].astype('category')
-        for col in [c for c in categorical_aht if c in X_aht.columns]: X_aht[col] = X_aht[col].astype('category')
-        for col in [c for c in categorical_awt if c in X_awt.columns]: X_awt[col] = X_awt[col].astype('category')
-        
-        print("-> Genererar prognoser...")
-        preds_low = model_vol_low.predict(X_volume[features_volume])
-        preds_median = model_vol_median.predict(X_volume[features_volume])
-        preds_high = model_vol_high.predict(X_volume[features_volume])
-        aht_preds = model_aht.predict(X_aht[features_aht])
-        awt_preds = model_awt.predict(X_awt[features_awt])
-
-        output_df = future_df_final.copy() 
-        output_df['DatumTid'] = output_df['ds']
-
-        output_df['Prognos_Låg'] = np.maximum(0, preds_low).round().astype(int)
-        output_df['Prognos_Antal_Samtal'] = np.maximum(0, preds_median).round().astype(int) 
-        output_df['Prognos_Hög'] = np.maximum(0, preds_high).round().astype(int)
-        output_df['Prognos_Snitt_Taltid_Sek'] = np.maximum(0, aht_preds).round().astype(int)
-        output_df['Prognos_Snitt_V_ntetid_Sek'] = np.maximum(0, awt_preds).round().astype(int)
-        
-        output_df.loc[output_df['Prognos_Antal_Samtal'] == 0, ['Prognos_Snitt_Taltid_Sek', 'Prognos_Snitt_V_ntetid_Sek', 'Prognos_Låg', 'Prognos_Hög']] = 0
-
-        output_df['Prognos_Samtalslast_Minuter'] = (output_df['Prognos_Antal_Samtal'] * output_df['Prognos_Snitt_Taltid_Sek']) / 60
-        occupancy_target = getattr(config, 'AGENT_OCCUPANCY_TARGET', 0.80)
-        if occupancy_target == 0: occupancy_target = 0.80
-        output_df['Prognos_Bemanningsbehov_Minuter'] = output_df['Prognos_Samtalslast_Minuter'] / occupancy_target
-        output_df['Prognos_Samtalslast_Minuter'] = output_df['Prognos_Samtalslast_Minuter'].round(2)
-        output_df['Prognos_Bemanningsbehov_Minuter'] = output_df['Prognos_Bemanningsbehov_Minuter'].round(2)
-
+    tn_arc = config.TABLE_NAMES['Forecast_Archive']
+    tn_op = config.TABLE_NAMES['Operative_Forecast']
     
+    # 1. SCORCHED EARTH CLEANUP
+    print(f"-> Rensar tabeller totalt...")
+    with mssql_engine.connect() as conn:
+        conn.execute(text(f"IF OBJECT_ID('{tn_op}', 'U') IS NOT NULL DROP TABLE [{tn_op}]"))
+        conn.execute(text(f"IF OBJECT_ID('{tn_arc}', 'U') IS NOT NULL DROP TABLE [{tn_arc}]"))
+        conn.commit()
 
-        columns_to_keep = [
-            'DatumTid', 'datum', 'Behavior_Segment', 
-            'Prognos_Antal_Samtal', 'Prognos_Låg', 'Prognos_Hög',
-            'Prognos_Snitt_Taltid_Sek', 'Prognos_Snitt_V_ntetid_Sek', 
-            'Prognos_Samtalslast_Minuter', 'Prognos_Bemanningsbehov_Minuter',
-            'timme', 'veckodag', 'vecka_nr', 'månad', 'kvartal', 'är_arbetsdag'
-        ]
-        columns_to_keep_exist = [col for col in columns_to_keep if col in output_df.columns]
-        output_df = output_df[columns_to_keep_exist]
+    forecast_start = get_forecast_start_date(mssql_engine)
+    
+    payload_vol = load_model_payload(os.path.join(config.MODEL_DIR, 'final_model_volume_operative.pkl'))
+    model_vol = payload_vol.get('model') if payload_vol else None
+    feats_vol = payload_vol.get('features') if payload_vol else []
+    cat_vol = payload_vol.get('categorical_features') if payload_vol else []
+    dtypes_vol = payload_vol.get('cat_dtypes', {}) if payload_vol else {}
 
+    hist_table = config.TABLE_NAMES['Hourly_Aggregated_History']
+    lookback = forecast_start - pd.Timedelta(days=370)
+    
+    print(f"-> Hämtar historik tom {forecast_start}...")
+    q_hist = f"""
+        SELECT CONVERT(date, ds) as ds, Tj_nstTyp, Behavior_Segment, 
+               SUM(Antal_Samtal) as Antal_Samtal
+        FROM [{hist_table}]
+        WHERE ds >= '{lookback.strftime('%Y-%m-%d')}'
+        AND ds < '{forecast_start.strftime('%Y-%m-%d')} 23:59:59' 
+        GROUP BY CONVERT(date, ds), Tj_nstTyp, Behavior_Segment
+    """
+    df_hist_raw = pd.read_sql(q_hist, mssql_engine)
+    df_hist_raw['ds'] = pd.to_datetime(df_hist_raw['ds']).dt.tz_localize(None).dt.normalize()
+    df_hist_raw['Tj_nstTyp'] = df_hist_raw['Tj_nstTyp'].astype(str).str.strip()
+    
+    # Stat
+    df_hist_temp = add_all_features(df_hist_raw.copy(), ds_col='ds')
+    recent_cutoff = forecast_start - pd.Timedelta(days=35)
+    df_recent = df_hist_temp[df_hist_temp['ds'] >= recent_cutoff]
+    df_stats = df_recent.groupby(['Tj_nstTyp', 'veckodag'])['Antal_Samtal'].mean().reset_index(name='Stat_Avg')
+    
+    # Prognos
+    df_vol_hist = df_hist_raw.groupby(['ds', 'Tj_nstTyp'])['Antal_Samtal'].sum().reset_index()
+    df_vol_hist = df_vol_hist[df_vol_hist['ds'] < forecast_start].copy()
 
-        # === SPARNING ===
-        table_name_forecast = config.TABLE_NAMES['Operative_Forecast']
-        table_name_staging = f"{table_name_forecast}_STAGING" 
-
-        try:
-            print(f"-> STEG 5a: Skriver {len(output_df)} rader till STAGING...")
-            output_df.to_sql(
-                table_name_staging, 
-                mssql_engine, 
-                if_exists='replace', 
-                index=False, 
-                chunksize=5000
-            )
-        except Exception as e:
-            print(f"FATALT FEL: Kunde inte skriva till STAGING. {e}")
-            sys.exit(1)
-
-        print(f"-> STEG 5b: Flyttar data till PROD (Auto-Create)...")
-        sql_transaction = f"""
-        IF OBJECT_ID('{table_name_forecast}', 'U') IS NOT NULL DROP TABLE [{table_name_forecast}];
-        SELECT * INTO [{table_name_forecast}] FROM [{table_name_staging}];
-        """
-
-        try:
-            with mssql_engine.connect() as connection:
-                connection.execute(text(sql_transaction))
-                connection.commit() 
-            print(f"KLART! Prognos sparad till: '{table_name_forecast}'.")
+    active_services = df_hist_raw['Tj_nstTyp'].unique()
+    hier = df_hist_raw[['Tj_nstTyp', 'Behavior_Segment']].drop_duplicates()
+    horizon = config.HOLDOUT_PERIOD_DAYS if config.RUN_MODE == 'VALIDATION' else config.FORECAST_HORIZON_DAYS
+    future_dates = pd.date_range(start=forecast_start, periods=horizon, freq='D')
+    
+    print(f"-> Startar Rullande Prognos ({horizon} dagar)...")
+    df_master = df_vol_hist.copy()
+    
+    for i, current_date in enumerate(future_dates):
+        weekday = current_date.weekday()
+        df_today_skeleton = pd.DataFrame({'ds': [current_date] * len(active_services), 'Tj_nstTyp': active_services})
+        df_today_skeleton['veckodag'] = weekday
+        df_today_skeleton = pd.merge(df_today_skeleton, df_stats, on=['Tj_nstTyp', 'veckodag'], how='left')
+        df_today_skeleton['Stat_Avg'] = df_today_skeleton['Stat_Avg'].fillna(0)
         
-        except Exception as e:
-            print(f"FATALT FEL: Kunde inte flytta data till PROD: {e}")
-            sys.exit(1)
-
-        # Arkivering
-        try:
-            print("-> Arkiverar prognos-körning...")
-            df_archive = output_df.copy() 
-            df_archive['ForecastRunDate'] = get_current_time().date()
-            archive_table_name = config.TABLE_NAMES['Forecast_Archive']
-            df_archive.to_sql(archive_table_name, mssql_engine, if_exists='append', index=False, chunksize=10000)
-            print(f"-> Prognos arkiverad.")
-        except Exception as e:
-            print(f"VARNING: Kunde inte arkivera prognos: {e}")
-
-    else:
-        print("-> Inga modeller laddades.")
-        sys.exit(1)
+        df_run = pd.concat([df_master, df_today_skeleton], ignore_index=True).sort_values(by=['Tj_nstTyp', 'ds'])
+        df_run = add_all_features(df_run, ds_col='ds')
+        df_run.columns = [re.sub(r'[^A-Za-z0-9_]+', '_', col) for col in df_run.columns]
+        df_run = create_daily_lags(df_run, ['Tj_nstTyp'], 'Antal_Samtal', [1, 7, 14, 28, 364])
         
-    print("\n--- Prognoskörning slutförd ---")
+        df_today_features = df_run[df_run['ds'] == current_date].copy()
+        
+        preds_op = np.zeros(len(df_today_features))
+        
+        if model_vol:
+            try:
+                X = df_today_features.reindex(columns=feats_vol, fill_value=0)
+                for c in cat_vol:
+                    if c in X.columns and c in dtypes_vol: X[c] = X[c].astype(dtypes_vol[c])
+                preds_op = model_vol.predict(X[feats_vol])
+            except: pass
+
+        final_preds = []
+        stat_avgs = df_today_skeleton.sort_values(by='Tj_nstTyp')['Stat_Avg'].values
+        lags_7 = df_today_features.sort_values(by='Tj_nstTyp')['Antal_Samtal_lag_7d'].fillna(0).values
+
+        for p_op, stat, l7 in zip(preds_op, stat_avgs, lags_7):
+            if p_op > 5: base_guess = (p_op * 0.5) + (stat * 0.5)
+            else: base_guess = stat
+            
+            if base_guess < (l7 * 0.5) and l7 > 10: final_guess = l7
+            else: final_guess = base_guess
+            
+            final_preds.append(max(0, final_guess))
+        
+        df_today_skeleton['Antal_Samtal'] = np.round(final_preds).astype(int)
+        df_today_skeleton['Prognos_Låg'] = (df_today_skeleton['Antal_Samtal'] * 0.8).astype(int)
+        df_today_skeleton['Prognos_Hög'] = (df_today_skeleton['Antal_Samtal'] * 1.2).astype(int)
+        
+        df_master = pd.concat([df_master, df_today_skeleton[['ds', 'Tj_nstTyp', 'Antal_Samtal', 'Prognos_Låg', 'Prognos_Hög']]], ignore_index=True)
+
+    # --- OUTPUT ---
+    df_forecast_final = df_master[df_master['ds'] >= forecast_start].copy()
+    df_forecast_final.rename(columns={'Antal_Samtal': 'Prognos_Volym'}, inplace=True)
+    
+    
+    TARGET_TOTAL = df_forecast_final['Prognos_Volym'].sum()
+    print(f"-> MÅL-VOLYM (Daglig): {int(TARGET_TOTAL)} samtal.")
+
+    # Tim-fördelning
+    df_base = pd.merge(df_forecast_final, hier, on='Tj_nstTyp', how='left')
+    df_shape = calculate_hourly_shape(mssql_engine, list(active_services), 'Tj_nstTyp')
+    
+    df_hourly_base = pd.DataFrame()
+    for dt in future_dates:
+        hours = pd.DataFrame({'ds': pd.date_range(dt, periods=24, freq='h')})
+        hours['datum'] = hours['ds'].dt.normalize()
+        df_hourly_base = pd.concat([df_hourly_base, hours])
+        
+    df_res = pd.merge(df_hourly_base, df_base, left_on='datum', right_on='ds', suffixes=('_h', ''))
+    df_res = add_all_features(df_res, ds_col='ds_h')
+    df_res = pd.merge(df_res, df_shape, on=['veckodag', 'timme', 'Tj_nstTyp'], how='left')
+    
+    # --- NY LOGIK: ÖPPETTIDER & NORMALISERING ---
+    
+    # 1. Sätt bas-vikt (0 istället för 1/24 för att inte fylla nätter med skräp)
+    df_res['Shape_Weight'] = df_res['Avg_Hourly_Proportion'].fillna(0)
+    
+    # 2. HÅRT FILTER: Stängt Helger + Nätter (Före 06:00, Efter 18:00)
+    # 0=Mån, 4=Fre, 5=Lör, 6=Sön
+    mask_closed = (
+        (df_res['ds_h'].dt.weekday >= 5) |       # Lördag/Söndag
+        (df_res['ds_h'].dt.hour >= 18) |         # Stänger 18:00
+        (df_res['ds_h'].dt.hour < 6)             # Öppnar 06:00 
+    )
+    df_res.loc[mask_closed, 'Shape_Weight'] = 0
+    
+    # 3. Normalisera Vikterna (Så att summan blir 1 per dag, men BARA på öppettider)
+    df_res['Datum_Dag'] = df_res['ds_h'].dt.normalize()
+    daily_weights = df_res.groupby(['Datum_Dag', 'Tj_nstTyp'])['Shape_Weight'].transform('sum')
+    
+    # Undvik division med 0 (om en kö(tjänst) används inte längre)
+    df_res['Normalized_Weight'] = np.where(daily_weights > 0, df_res['Shape_Weight'] / daily_weights, 0)
+
+    # 4. Fördela Volymen med de nya vikterna
+    df_res['Temp_Vol'] = df_res['Prognos_Volym'] * df_res['Normalized_Weight']
+    df_res['Temp_Low'] = df_res['Prognos_Låg'] * df_res['Normalized_Weight']
+    df_res['Temp_High'] = df_res['Prognos_Hög'] * df_res['Normalized_Weight']
+    
+    # 5. Summera och Skala (Mathematical Safety Net - Sista kollen)
+    sums = df_res.groupby(['Datum_Dag', 'Tj_nstTyp'])[['Temp_Vol', 'Temp_Low', 'Temp_High']].transform('sum')
+    
+    df_res['Scale_Vol'] = np.where(sums['Temp_Vol'] > 0, df_res['Prognos_Volym'] / sums['Temp_Vol'], 0)
+    df_res['Scale_Low'] = np.where(sums['Temp_Low'] > 0, df_res['Prognos_Låg'] / sums['Temp_Low'], 0)
+    df_res['Scale_High'] = np.where(sums['Temp_High'] > 0, df_res['Prognos_Hög'] / sums['Temp_High'], 0)
+    
+    df_res['Prognos_Antal_Samtal'] = (df_res['Temp_Vol'] * df_res['Scale_Vol']).round().astype(int)
+    df_res['Prognos_Låg'] = (df_res['Temp_Low'] * df_res['Scale_Low']).round().astype(int)
+    df_res['Prognos_Hög'] = (df_res['Temp_High'] * df_res['Scale_High']).round().astype(int)
+    
+    # Kontrollsumma
+    FINAL_SUM = df_res['Prognos_Antal_Samtal'].sum()
+    print(f"-> SLUT-VOLYM (Öppettider Anpassade): {int(FINAL_SUM)}")
+    
+    # Färdigställ
+    final_cols = ['ds_h', 'Tj_nstTyp', 'Behavior_Segment', 'Prognos_Antal_Samtal', 'Prognos_Låg', 'Prognos_Hög']
+    df_out = df_res[final_cols].rename(columns={'ds_h':'DatumTid', 'Tj_nstTyp':'TjänstTyp'})
+    df_out['Prognos_Snitt_Taltid_Sek'] = 180 
+    df_out['ForecastRunDate'] = pd.to_datetime(config.VALIDATION_SETTINGS['FORECAST_RUN_DATE_SQL']) if config.RUN_MODE == 'VALIDATION' else datetime.now().date()
+    
+    # --- SPARNING ---
+    print(f"-> Sparar till {tn_op} (LIVE)...")
+    df_out.to_sql(tn_op, mssql_engine, if_exists='replace', index=False)
+    
+    print(f"-> Sparar till {tn_arc} (ARKIV)...")
+    df_out.to_sql(tn_arc, mssql_engine, if_exists='replace', index=False)
+
+    print("-> JOBB 3 KLART. Prognosen är nu filtrerad för öppettider.")
 
 if __name__ == '__main__':
     create_final_forecast()

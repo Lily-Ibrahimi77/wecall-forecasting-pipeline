@@ -30,15 +30,12 @@ env/
 # Secrets and credentials
 .env
 
-# Datasets - Var försiktig med denna! 
-# Om du har SMÅ, icke-känsliga test-CSV:er kan du ta bort raden nedan.
-# Men stora eller känsliga datafiler ska ALDRIG checkas in.
+
 *.csv
 *.db
 *.sqlite3
 
-# Sparade modeller
-# Dessa kan bli stora och bör inte versionshanteras.
+
 *.joblib
 *.pkl
 
@@ -48,3 +45,7 @@ env/
 
 # OS-specifika filer
 .DS_Store
+
+config.py
+_TEST_config.py
+incomingnumber.csv

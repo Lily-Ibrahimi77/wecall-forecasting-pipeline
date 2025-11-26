@@ -121,7 +121,7 @@ def sync_bronze_layer():
         except Exception as e:
             print(f"FEL vid synk av {target_table}: {e}")
             traceback.print_exc()
-            # Vi fortsätter till nästa tabell även om en misslyckas
+            # fortsätter till nästa tabell även om en misslyckas
 
     print("\n--- Bronze-laddning slutförd ---")
 
