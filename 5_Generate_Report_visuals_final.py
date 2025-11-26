@@ -1,12 +1,12 @@
 """
 ================================================================
-JOBB 5: Skapa Rapportunderlag (Slutgiltig Version)
+JOBB 5: Generate Report Visuals (Final Version)
 ================================================================
 Data: 
-  - Prognos: 'Frcast_Operative_Calls_By_Service' (Lager 1 Output)
-  - Verklighet: 'Fact_Hourly_Aggregated_History' (Facit)
-Period: 2025-09-24 till 2025-09-30
-Output: KPI:er (wMAPE) + Grafer (.png)
+  - Forecast: 'Frcast_Operative_Calls_By_Service'
+  - Actuals: 'Fact_Hourly_Aggregated_History'
+Period: 2025-09-24 to 2025-09-30
+Output: KPIs (wMAPE) + Graphs (.png)
 """
 
 import pandas as pd
@@ -16,29 +16,28 @@ from sqlalchemy import create_engine
 import config
 import os
 
-
-
-# grafer
+# Snyggare grafer
 plt.style.use('ggplot')
+# Färger: Actual (Blå), Forecast (Orange)
 COLORS = {'Actual': '#2E86C1', 'Forecast': '#E67E22'} 
 
 def generate_report_evidence():
-    print("--- GENERERAR RAPPORT-UNDERLAG (FRÅN FACT TABLES) ---")
+    print("--- GENERATING REPORT EVIDENCE (FROM FACT TABLES) ---")
     
     try:
         mssql_engine = create_engine(config.MSSQL_CONN_STR)
     except Exception as e:
-        print(f"Fel vid anslutning: {e}")
+        print(f"Connection error: {e}")
         return
 
     start_date = '2025-09-24'
     end_date = '2025-09-30'
     
     # ---------------------------------------------------------
-    # 1. HÄMTA PROGNOS
+    # 1. GET FORECAST
     # ---------------------------------------------------------
-    table_forecast = config.TABLE_NAMES['Forecast_Archive'] # Frcast_Operative_Calls_By_Service
-    print(f"1. Hämtar PROGNOS från {table_forecast}...")
+    table_forecast = config.TABLE_NAMES['Forecast_Archive']
+    print(f"1. Fetching FORECAST from {table_forecast}...")
     
     q_fc = f"""
         SELECT 
@@ -52,10 +51,10 @@ def generate_report_evidence():
     df_fc['Datum'] = pd.to_datetime(df_fc['Datum'])
     
     # ---------------------------------------------------------
-    # 2. HÄMTA VERKLIGHET (FACIT)
+    # 2. GET ACTUALS (FACIT)
     # ---------------------------------------------------------
-    table_history = config.TABLE_NAMES['Hourly_Aggregated_History'] # Fact_Hourly_Aggregated_History
-    print(f"2. Hämtar FACIT från {table_history}...")
+    table_history = config.TABLE_NAMES['Hourly_Aggregated_History']
+    print(f"2. Fetching ACTUALS from {table_history}...")
     
     q_act = f"""
         SELECT 
@@ -69,9 +68,9 @@ def generate_report_evidence():
     df_act['Datum'] = pd.to_datetime(df_act['Datum'])
 
     # ---------------------------------------------------------
-    # 3. JÄMFÖR & RÄKNA KPI
+    # 3. MERGE & CALCULATE KPI
     # ---------------------------------------------------------
-    print("3. Beräknar KPI:er...")
+    print("3. Calculating KPIs...")
     df_merged = pd.merge(df_act, df_fc, on='Datum', how='outer').fillna(0)
     df_merged = df_merged.sort_values('Datum')
     
@@ -90,62 +89,69 @@ def generate_report_evidence():
         accuracy = 0
 
     print("\n" + "="*50)
-    print(f" RAPPORT-DATA: {start_date} till {end_date}")
+    print(f" REPORT DATA: {start_date} to {end_date}")
     print("="*50)
-    print(f" Verkligt Antal:   {int(total_act)}")
-    print(f" Prognos Antal:    {int(total_fc)}")
-    print(f" Differens:        {int(diff)} ({diff/total_act:+.1%})")
+    print(f" Actual Total:     {int(total_act)}")
+    print(f" Forecast Total:   {int(total_fc)}")
+    print(f" Difference:       {int(diff)} ({diff/total_act:+.1%})")
     print("-" * 30)
-    print(f" wMAPE (Fel):      {wmape:.2f}%")
-    print(f" Träffsäkerhet:    {accuracy:.2f}%")
+    print(f" wMAPE (Error):    {wmape:.2f}%")
+    print(f" Accuracy:         {accuracy:.2f}%")
     print("="*50 + "\n")
 
     # ---------------------------------------------------------
-    # 4. SKAPA GRAFER TILL RAPPORTEN
+    # 4. CREATE GRAPHS (ENGLISH)
     # ---------------------------------------------------------
-    print("4. Skapar grafer...")
+    print("4. Creating graphs...")
     
     # Graf 1: Daglig Trend (Linje)
     plt.figure(figsize=(10, 6))
-    plt.plot(df_merged['Datum'], df_merged['Actual_Volym'], label='Verkligt Utfall', color=COLORS['Actual'], marker='o', linewidth=3)
-    plt.plot(df_merged['Datum'], df_merged['Forecast_Volym'], label='AI Prognos', color=COLORS['Forecast'], marker='o', linestyle='--', linewidth=3)
     
-    plt.title(f"Daglig Träffsäkerhet: {start_date} - {end_date}", fontsize=16)
-    plt.ylabel("Antal Samtal", fontsize=12)
-    plt.xlabel("Datum", fontsize=12)
+    # ÄNDRAT HÄR: Labels till engelska ('Actuals', 'AI Forecast')
+    plt.plot(df_merged['Datum'], df_merged['Actual_Volym'], label='Actuals', color=COLORS['Actual'], marker='o', linewidth=3)
+    plt.plot(df_merged['Datum'], df_merged['Forecast_Volym'], label='AI Forecast', color=COLORS['Forecast'], marker='o', linestyle='--', linewidth=3)
+    
+    # ÄNDRAT HÄR: Titlar och axlar till engelska
+    plt.title(f"Daily Forecast Accuracy: {start_date} - {end_date}", fontsize=16)
+    plt.ylabel("Call Volume", fontsize=12)
+    plt.xlabel("Date", fontsize=12)
     plt.legend(fontsize=12)
     plt.grid(True, alpha=0.3)
     
-    # datum på X-axeln
+    # Snygga datum på X-axeln
     plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
     plt.gca().xaxis.set_major_locator(mdates.DayLocator())
     plt.xticks(rotation=45)
     
     plt.tight_layout()
     plt.savefig('Rapport_Figur_1_Trend.png', dpi=300)
-    print("   -> Sparade 'Rapport_Figur_1_Trend.png'")
+    print("   -> Saved 'Rapport_Figur_1_Trend.png'")
 
     # Graf 2: Totaljämförelse (Stapel)
     plt.figure(figsize=(7, 6))
-    bars = plt.bar(['Verkligt', 'AI Prognos'], [total_act, total_fc], color=[COLORS['Actual'], COLORS['Forecast']], width=0.6)
+    
+    # ÄNDRAT HÄR: 'Actuals' istället för 'Verkligt', 'AI Forecast' istället för 'AI Prognose'
+    bars = plt.bar(['Actuals', 'AI Forecast'], [total_act, total_fc], color=[COLORS['Actual'], COLORS['Forecast']], width=0.6)
     
     # Lägg till siffror och % på staplarna
     for i, bar in enumerate(bars):
         height = bar.get_height()
         label = f"{int(height)}"
-        if i == 1: 
+        if i == 1: # På prognos-stapeln, lägg till felprocent
             diff_pct = (total_fc / total_act) - 1
             label += f"\n({diff_pct:+.1%})"
             
         plt.text(bar.get_x() + bar.get_width()/2, height/2, label, ha='center', va='center', fontsize=14, fontweight='bold', color='white')
         
-    plt.title(f"Total Volym & wMAPE ({wmape:.1f}%)", fontsize=16)
-    plt.ylabel("Totalt Antal Samtal", fontsize=12)
+    # ÄNDRAT HÄR: Engelsk titel och Y-axel
+    plt.title(f"Total Volume & wMAPE ({wmape:.1f}%)", fontsize=16)
+    plt.ylabel("Total Call Volume", fontsize=12)
+    
     plt.tight_layout()
     plt.savefig('Rapport_Figur_2_Total.png', dpi=300)
-    print("   -> Sparade 'Rapport_Figur_2_Total.png'")
+    print("   -> Saved 'Rapport_Figur_2_Total.png'")
 
-    print("\nKLART! Använd bilderna och siffrorna i din rapport.")
+    print("\nDONE! Use the generated images in your report.")
 
 if __name__ == '__main__':
     generate_report_evidence()
