@@ -41,66 +41,6 @@ ECHO ==========================================================
 ECHO KOR PIPELINE...
 ECHO ==========================================================
 
-ECHO ----------------------------------------------------------
-ECHO Steg 0: Kor 0_Load_Bronze_Data.py...
-ECHO (Kopierar radata fran MariaDB till MSSQL Bronze-lager)
-ECHO ----------------------------------------------------------
-python "0_Load_Bronze_Data.py"
-IF %ERRORLEVEL% NEQ 0 (
-    ECHO FEL: 0_Load_Bronze_Data.py misslyckades!
-    GOTO :ERROR
-)
-
-ECHO.
-ECHO ----------------------------------------------------------
-ECHO Steg 1: Kor 1_Extract_Operative_Data.py...
-ECHO (Hamtar 16 manader historik fran Bronze till Silver)
-ECHO ----------------------------------------------------------
-python "1_Extract_Operative_Data.py"
-IF %ERRORLEVEL% NEQ 0 (
-    ECHO FEL: 1_Extract_Operative_Data.py misslyckades!
-    GOTO :ERROR
-)
-
-ECHO.
-ECHO ----------------------------------------------------------
-ECHO Steg 1.5: Kor 1.5_Run_Customer_Segmentation.py (K-Means)... 
-ECHO (Bygger dynamiska beteendesegment och 'Peak Patterns')
-ECHO ----------------------------------------------------------
-python "1.5_Run_Customer_Segmentation.py"
-IF %ERRORLEVEL% NEQ 0 (
-    ECHO FEL: 1.5_Run_Customer_Segmentation.py misslyckades!
-    GOTO :ERROR
-)
-
-ECHO.
-ECHO ----------------------------------------------------------
-ECHO Steg 2: Kor 2_Train_Operative_Model.py...
-ECHO (Tranar hierarkisk modell pa (Ko, Kund, Segment))
-ECHO ----------------------------------------------------------
-python "2_Train_Operative_Model.py"
-IF %ERRORLEVEL% NEQ 0 (
-    ECHO FEL: 2_Train_Operative_Model.py misslyckades!
-    GOTO :ERROR
-)
-
-
-ECHO.
-ECHO ----------------------------------------------------------
-ECHO Steg 3: Kor 3_Run_Operative_Forecast.py (med arkivering)...
-ECHO ----------------------------------------------------------
-
-python "3_Run_Operative_Forecast.py"
-
-IF %ERRORLEVEL% NEQ 0 (
-
-    ECHO FEL: 3_Run_Operative_Forecast.py misslyckades!
-
-    GOTO :CLEANUP_AND_ERROR
-
-)
-
-
 
 ECHO ----------------------------------------------------------
 ECHO Steg 5: Kor 4_evaluate_forcast.py (Feedback-loop)...
@@ -110,7 +50,6 @@ IF %ERRORLEVEL% NEQ 0 (
     ECHO FEL: 4_evaluate_forcast.py misslyckades!
     GOTO :CLEANUP_AND_ERROR
 )
-
 
 ECHO.
 ECHO ==========================================================

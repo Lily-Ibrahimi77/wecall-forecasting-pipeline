@@ -5,7 +5,7 @@ JOBB 5: Generate Report Visuals (Final Version)
 Data: 
   - Forecast: 'Frcast_Operative_Calls_By_Service'
   - Actuals: 'Fact_Hourly_Aggregated_History'
-Period: 2025-09-24 to 2025-09-30
+Period: hämtas från config validation mode
 Output: KPIs (wMAPE) + Graphs (.png)
 """
 
@@ -30,8 +30,9 @@ def generate_report_evidence():
         print(f"Connection error: {e}")
         return
 
-    start_date = '2025-09-24'
-    end_date = '2025-09-30'
+    # Hämta datum dynamiskt från config istället för att hårdkoda
+    start_date = config.VALIDATION_SETTINGS['EVALUATION_START_DATE']
+    end_date = config.VALIDATION_SETTINGS['EVALUATION_END_DATE']
     
     # ---------------------------------------------------------
     # 1. GET FORECAST
