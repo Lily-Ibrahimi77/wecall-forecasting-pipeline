@@ -28,7 +28,6 @@ The solution is built on a robust **Medallion Architecture** (Bronze/Silver/Gold
 
 The system follows a strict data engineering workflow to decouple analysis from transactional sources.
 
-```mermaid
 graph LR
     A[Source: MariaDB] -->|Job 0| B(Bronze Layer: Raw MSSQL)
     B -->|Job 1| C(Silver Layer: Cleaned & Features)
@@ -55,7 +54,10 @@ Business Value,High,Enables proactive staffing 14 days in advance.
 Visualizations
 Below are examples of the generated forecast reports:
 
-<div align="center"> <img src="Rapport_Figur_1_Trend.png" width="45%" alt="Daily Trend"> <img src="Rapport_Figur_2_Total.png" width="45%" alt="Total Volume"> </div>
+<p align="center">
+  <img src="Rapport_Figur_1_Trend.png" width="45%" />
+  <img src="Rapport_Figur_2_Total.png" width="45%" />
+</p>
 
 🛠️ Tech Stack
 Language: Python 3.x
@@ -69,6 +71,7 @@ Orchestration: Batch Scripts (.bat) & Windows Task Scheduler
 Visualization: Matplotlib (Reporting), Power BI (Dashboarding)
 
 📂 Project Structure
+
 ├── 0_Load_Bronze_Data.py           # ETL: Ingests raw data from source
 ├── 1_Extract_Operative_Data.py     # ETL: Cleans data, handles Redials
 ├── 1.5_Run_Customer_Segmentation.py # ML: K-Means clustering of customers
