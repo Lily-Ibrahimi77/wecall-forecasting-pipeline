@@ -121,7 +121,7 @@ Containerization: Dockerize the pipeline for cloud deployment (Azure/AWS).
 API Integration: Serve forecasts via REST API instead of direct SQL insertion.
 
 👩‍💻 Author
-Lily Ibrahimi BI Analyst & AI Specialist
+Lily Ibrahimi BI Analyst
 
 Built as part of a thesis project on Data-Driven Operational Steering.
 
@@ -139,5 +139,3 @@ Built as part of a thesis project on Data-Driven Operational Steering.
 2.  Klistra in texten ovan.
 3.  Byt ut `YOUR_USERNAME` i klon-länken mot ditt GitHub-användarnamn.
 4.  Gör en `git add README.md`, `git commit` och `git push`.
-
-Klart! Nu ser ditt repo ut som ett senior-projekt.
